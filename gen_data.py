@@ -7,7 +7,8 @@ Produces JSONL files with controllable token length (100-1300 tokens via Qwen to
 Speedups vs naive version:
   - Estimate-then-trim: generate full chain in one shot, tokenize ONCE to verify,
     trim trailing steps if over budget. Eliminates per-step tokenizer calls.
-  - Multiprocessing: one worker per CPU core, each with its own tokenizer instance.
+  - Multiprocessing with fork: tokenizer loaded ONCE in main process, inherited by
+    all workers via copy-on-write memory — no per-worker download or disk read.
   - Batch JSONL write at the end.
 
 Usage:
@@ -23,22 +24,27 @@ import random
 import time
 
 # Prevent OpenBLAS / OpenMP from spawning dozens of threads per worker.
-# Each gen_data worker is CPU-bound on pure Python, not BLAS — one thread suffices.
+# Each gen_data worker is CPU-bound on pure Python — one thread suffices.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
-# Disable HuggingFace tokenizer parallelism inside each worker (workers are already parallel).
+# Disable HuggingFace tokenizer parallelism inside each worker.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 # ---------------------------------------------------------------------------
-# Worker-level globals (initialized once per process)
+# Tokenizer global — loaded ONCE in main process, inherited by all workers via fork
 # ---------------------------------------------------------------------------
 
 _tokenizer = None
 
 
-def _init_worker(tokenizer_name):
+def _load_tokenizer(tokenizer_name):
+    """Load tokenizer into the global in the MAIN process before forking.
+
+    With fork start method, child processes inherit this directly from
+    the parent's memory (copy-on-write). No per-worker download or disk read.
+    """
     global _tokenizer
     from transformers import AutoTokenizer
     _tokenizer = AutoTokenizer.from_pretrained(
@@ -235,22 +241,21 @@ def _generate_batch(args):
 # ---------------------------------------------------------------------------
 
 def generate_parallel(num_examples, min_tok, max_tok, base_seed,
-                      num_workers, tokenizer_name,
-                      bin_ranges=None, chunk_size=500):
+                      num_workers, bin_ranges=None, chunk_size=500):
     """
     Generate num_examples examples using a multiprocessing pool.
 
+    Tokenizer must already be loaded in the main process (_load_tokenizer called
+    before this). Workers inherit it via fork — no re-loading in workers.
+
     bin_ranges: list of (lo, hi) per example for eval binning, or None.
     """
-    # Pre-generate seeds so results are fully reproducible
     master_rng = random.Random(base_seed)
     seeds = [master_rng.randint(0, 2**31) for _ in range(num_examples * 2)]
 
-    pool = mp.Pool(
-        processes=num_workers,
-        initializer=_init_worker,
-        initargs=(tokenizer_name,),
-    )
+    # No initializer needed: tokenizer is already in global _tokenizer,
+    # inherited by all workers via fork (copy-on-write).
+    pool = mp.Pool(processes=num_workers)
 
     results = []
     seed_idx = 0
@@ -259,11 +264,9 @@ def generate_parallel(num_examples, min_tok, max_tok, base_seed,
 
     while len(results) < num_examples:
         needed = num_examples - len(results)
-        # Build chunks for this round
         chunks = []
         for _ in range(0, min(needed * 2, num_examples * 2 - seed_idx), chunk_size):
             if seed_idx >= len(seeds):
-                # Extend seeds if needed (rare)
                 seeds.extend(master_rng.randint(0, 2**31)
                              for _ in range(chunk_size))
             batch_seeds = seeds[seed_idx: seed_idx + chunk_size]
@@ -271,7 +274,6 @@ def generate_parallel(num_examples, min_tok, max_tok, base_seed,
 
             if bin_ranges is not None:
                 batch_bins = bin_ranges[len(results): len(results) + len(batch_seeds)]
-                # Pad if list is exhausted (shouldn't happen in normal use)
                 while len(batch_bins) < len(batch_seeds):
                     batch_bins.append((min_tok, max_tok))
             else:
@@ -319,7 +321,6 @@ def make_eval_bin_ranges(num_examples, min_tok, max_tok, bin_width=50):
         count = per_bin + (1 if i < remainder else 0)
         ranges.extend([(lo, hi)] * count)
 
-    # Shuffle so workers get a mix of easy/hard bins
     random.Random(0).shuffle(ranges)
     return ranges[:num_examples]
 
@@ -349,6 +350,12 @@ def main():
     print(f"Workers: {args.num_workers}  |  chunk_size: {args.chunk_size}")
     print(f"Tokenizer: {args.tokenizer}")
 
+    # Load tokenizer ONCE here in the main process.
+    # With fork, all workers inherit this directly — no per-worker loading.
+    print("Loading tokenizer (once, shared with all workers via fork)...")
+    _load_tokenizer(args.tokenizer)
+    print("Tokenizer ready.")
+
     # --- Training set ---
     print(f"\nGenerating {args.num_train} training examples "
           f"[{args.min_tokens}-{args.max_tokens} tokens]...")
@@ -359,7 +366,6 @@ def main():
         max_tok=args.max_tokens,
         base_seed=args.seed,
         num_workers=args.num_workers,
-        tokenizer_name=args.tokenizer,
         bin_ranges=None,
         chunk_size=args.chunk_size,
     )
@@ -383,7 +389,6 @@ def main():
         max_tok=args.max_tokens,
         base_seed=args.seed + 1,
         num_workers=args.num_workers,
-        tokenizer_name=args.tokenizer,
         bin_ranges=eval_bin_ranges,
         chunk_size=args.chunk_size,
     )
@@ -408,8 +413,7 @@ def main():
 
 
 if __name__ == "__main__":
-    # Use fork on Linux (H100 server): avoids spawning a full Python interpreter
-    # per worker, which hits OS process limits. Fork is safe here because the
-    # tokenizer is not loaded in the main process — workers load it via _init_worker.
+    # fork on Linux: workers inherit the already-loaded tokenizer from the main
+    # process via copy-on-write — no re-download, no per-worker disk read.
     mp.set_start_method("fork", force=True)
     main()
