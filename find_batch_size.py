@@ -40,7 +40,7 @@ def main():
         subfolder="llm1",
         torch_dtype=torch.bfloat16,
         device_map=args.device,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         use_safetensors=True,
     )
     model.model.llm1 = encoder_fa
