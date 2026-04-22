@@ -22,6 +22,14 @@ import os
 import random
 import time
 
+# Prevent OpenBLAS / OpenMP from spawning dozens of threads per worker.
+# Each gen_data worker is CPU-bound on pure Python, not BLAS — one thread suffices.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+# Disable HuggingFace tokenizer parallelism inside each worker (workers are already parallel).
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 
 # ---------------------------------------------------------------------------
 # Worker-level globals (initialized once per process)
@@ -400,5 +408,8 @@ def main():
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
+    # Use fork on Linux (H100 server): avoids spawning a full Python interpreter
+    # per worker, which hits OS process limits. Fork is safe here because the
+    # tokenizer is not loaded in the main process — workers load it via _init_worker.
+    mp.set_start_method("fork", force=True)
     main()
