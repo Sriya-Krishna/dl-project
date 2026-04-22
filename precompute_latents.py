@@ -2,10 +2,16 @@
 precompute_latents.py — Run the C3 encoder on all training/eval data and save
 projected latent vectors as .pt shards.
 
+Speedups vs naive version:
+  - Pre-tokenize ALL examples upfront (no tokenizer in the GPU hot loop)
+  - Sort by context length for tight batching (minimal padding waste)
+  - Reload encoder with flash_attention_2 after main model load
+  - torch.inference_mode() instead of no_grad
+
 For each example:
-  1. Tokenize: {text}<img><imgpad>*32</img>
+  1. Tokenize: {text_tokens} + [<img>, <imgpad>*32, </img>]
   2. Embed via llm1, replace <imgpad> positions with Q.weight
-  3. Forward through llm1, extract hidden_states[-1] at query positions -> [32, 1536]
+  3. Forward through llm1 -> extract hidden_states[-1] at query positions -> [32, 1536]
   4. Project via mm_projector -> [32, 2048]
   5. Save {latents: [32,2048], target_ids: [L]} per example
 """
@@ -13,22 +19,22 @@ For each example:
 import argparse
 import json
 import os
-from pathlib import Path
+import time
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2ForCausalLM
 
 
-DEFAULT_IMAGE_PATCH_TOKEN = "<imgpad>"
-DEFAULT_IM_START_TOKEN = "<img>"
-DEFAULT_IM_END_TOKEN = "</img>"
-
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
 
 def load_model(model_name, device="cuda"):
-    """Load the full C3 model (encoder + decoder)."""
+    """Load C3 model, then swap the encoder for a flash_attention_2 version."""
     print(f"Loading C3 model from {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(
         model_name, trust_remote_code=True)
+
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         trust_remote_code=True,
@@ -37,158 +43,234 @@ def load_model(model_name, device="cuda"):
         use_safetensors=True,
         pad_token_id=tokenizer.eos_token_id,
     )
+
+    # Swap encoder (llm1) for flash_attention_2 version — allows larger batches
+    print("Reloading encoder with flash_attention_2...")
+    encoder_fa = Qwen2ForCausalLM.from_pretrained(
+        model_name,
+        subfolder="llm1",
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+        attn_implementation="flash_attention_2",
+        use_safetensors=True,
+    )
+    model.model.llm1 = encoder_fa
+    del encoder_fa
+    torch.cuda.empty_cache()
+
     model.eval()
     model.requires_grad_(False)
-    print("Model loaded.")
+    print("Model ready.")
     return model, tokenizer
 
 
-def build_context_string(text, latent_len=32):
-    """Build the encoder input string: {text}<img><imgpad>x32</img>"""
-    pad_tokens = DEFAULT_IMAGE_PATCH_TOKEN * latent_len
-    return text + DEFAULT_IM_START_TOKEN + pad_tokens + DEFAULT_IM_END_TOKEN
+# ---------------------------------------------------------------------------
+# Pre-tokenize all data upfront (CPU, done once)
+# ---------------------------------------------------------------------------
 
-
-def encode_batch(model, tokenizer, texts, device="cuda"):
+def pretokenize_all(tokenizer, examples, latent_len, chunk_size=2000):
     """
-    Run the C3 encoder on a batch of texts.
-    Returns projected latents [B, 32, 2048] and per-example target token IDs.
+    Tokenize every example once on CPU before any GPU work.
+
+    Context IDs = raw text token IDs + [<img>, <imgpad>*32, </img>]
+    We append the suffix token IDs directly instead of string-building,
+    which is ~4x faster for large datasets.
+
+    Returns:
+        ctx_ids_list  : list of lists of int   (variable length, no padding)
+        target_ids_list: list of torch.LongTensor
     """
-    config = model.config
-    latent_len = config.latent_token_len  # 32
-    im_start_token = config.im_start_token  # 151857
+    im_start = tokenizer.convert_tokens_to_ids("<img>")
+    im_patch = tokenizer.convert_tokens_to_ids("<imgpad>")
+    im_end   = tokenizer.convert_tokens_to_ids("</img>")
+    suffix   = [im_start] + [im_patch] * latent_len + [im_end]
 
-    # Build context strings and tokenize for encoder
-    context_strings = [build_context_string(t, latent_len) for t in texts]
-    ctx_enc = tokenizer(
-        context_strings,
-        return_tensors="pt",
-        padding=True,
-        truncation=False,
-    )
-    context_ids = ctx_enc["input_ids"].to(device)
-    context_attention_mask = ctx_enc["attention_mask"].to(device)
+    texts = [ex["text"] for ex in examples]
+    ctx_ids_list    = []
+    target_ids_list = []
+    t0 = time.time()
 
-    # Also tokenize raw text for target token IDs
-    raw_enc = tokenizer(texts, truncation=False)
-    target_ids_list = [torch.tensor(ids, dtype=torch.long) for ids in raw_enc["input_ids"]]
+    for start in range(0, len(texts), chunk_size):
+        chunk = texts[start: start + chunk_size]
+        enc = tokenizer(chunk, truncation=False, add_special_tokens=False)
+        for ids in enc["input_ids"]:
+            target_ids_list.append(torch.tensor(ids, dtype=torch.long))
+            ctx_ids_list.append(ids + suffix)
 
-    # --- Encoder forward (replicates C3QwenModel.forward encoder path) ---
-    encoder = model.model.llm1  # Qwen2ForCausalLM (1.5B)
-    Q_weight = model.model.Q.weight  # [32, 1536]
-    mm_proj = model.model.mm_projector  # Linear(1536, 2048)
+        done = start + len(chunk)
+        if done % 50_000 == 0 or done == len(texts):
+            elapsed = time.time() - t0
+            print(f"  Pre-tokenized {done}/{len(texts)}  ({elapsed:.0f}s)")
 
-    # Embed context_ids through encoder's embedding table
-    context_embeds = encoder.model.embed_tokens(context_ids)  # [B, S, 1536]
+    return ctx_ids_list, target_ids_list
 
-    # For each example, find <img> position and replace next 32 <imgpad> with Q.weight
-    batch_size = context_ids.shape[0]
-    image_start_positions = []
-    for i in range(batch_size):
-        img_starts = (context_ids[i] == im_start_token).nonzero(as_tuple=True)[0]
-        assert len(img_starts) == 1, f"Expected 1 <img> token, got {len(img_starts)}"
-        pos = img_starts[0].item()
-        image_start_positions.append(pos)
-        # Replace positions [pos+1, pos+32] with Q.weight
-        context_embeds[i, pos + 1: pos + 1 + latent_len] = Q_weight.to(
-            device=context_embeds.device, dtype=context_embeds.dtype)
 
-    # Forward through llm1
-    with torch.no_grad():
-        llm1_out = encoder(
+# ---------------------------------------------------------------------------
+# Encoder batch forward (operates on pre-tokenized IDs)
+# ---------------------------------------------------------------------------
+
+def encode_batch(model, ctx_ids_batch, device="cuda"):
+    """
+    Run one GPU batch.
+
+    Args:
+        ctx_ids_batch: list of pre-tokenized context ID lists (variable len)
+
+    Returns:
+        latents_proj: [B, 32, 2048]  bfloat16  on CPU
+    """
+    config     = model.config
+    latent_len = config.latent_token_len   # 32
+    im_start   = config.im_start_token     # 151857
+    encoder    = model.model.llm1
+    Q_weight   = model.model.Q.weight      # [32, 1536]
+    mm_proj    = model.model.mm_projector  # Linear(1536, 2048)
+
+    # Pad batch to uniform length
+    lengths  = [len(ids) for ids in ctx_ids_batch]
+    max_len  = max(lengths)
+    pad_id   = 0  # padding doesn't matter — masked out
+    B        = len(ctx_ids_batch)
+
+    input_ids_np  = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
+    attention_mask = torch.zeros((B, max_len), dtype=torch.long, device=device)
+    for i, (ids, L) in enumerate(zip(ctx_ids_batch, lengths)):
+        input_ids_np[i, :L]    = torch.tensor(ids, dtype=torch.long, device=device)
+        attention_mask[i, :L]  = 1
+
+    # Find <img> positions (always right-aligned before </imgpad>s)
+    # <img> is the (L - latent_len - 2)-th token (0-indexed) for each example,
+    # but we verify via nonzero for safety.
+    img_start_positions = []
+    for i in range(B):
+        hits = (input_ids_np[i] == im_start).nonzero(as_tuple=True)[0]
+        assert len(hits) == 1, f"Example {i}: expected 1 <img>, got {len(hits)}"
+        img_start_positions.append(hits[0].item())
+
+    # Embed and inject Q.weight
+    context_embeds = encoder.model.embed_tokens(input_ids_np)  # [B, S, 1536]
+    Q_cast = Q_weight.to(device=device, dtype=context_embeds.dtype)
+    for i, pos in enumerate(img_start_positions):
+        context_embeds[i, pos + 1: pos + 1 + latent_len] = Q_cast
+
+    # Encoder forward
+    with torch.inference_mode():
+        out = encoder(
             input_ids=None,
             inputs_embeds=context_embeds,
-            attention_mask=context_attention_mask,
+            attention_mask=attention_mask,
             output_hidden_states=True,
             return_dict=True,
         )
-    last_hidden = llm1_out["hidden_states"][-1]  # [B, S, 1536]
+    last_hidden = out["hidden_states"][-1]  # [B, S, 1536]
 
-    # Extract the 32 query positions from each example
-    latents_raw = []
-    for i in range(batch_size):
-        pos = image_start_positions[i]
-        h = last_hidden[i, pos + 1: pos + 1 + latent_len]  # [32, 1536]
-        latents_raw.append(h)
-    latents_raw = torch.stack(latents_raw)  # [B, 32, 1536]
-    # Cast to match mm_projector weight dtype (bfloat16) — llm1 may output float16
+    # Extract query positions
+    latents_raw = torch.stack([
+        last_hidden[i, img_start_positions[i] + 1:
+                       img_start_positions[i] + 1 + latent_len]
+        for i in range(B)
+    ])  # [B, 32, 1536]
+
+    # Cast to mm_projector dtype (main model may differ from llm1 output dtype)
     latents_raw = latents_raw.to(dtype=mm_proj.weight.dtype)
 
-    # Project to decoder space
-    with torch.no_grad():
-        latents_proj = mm_proj(latents_raw)  # [B, 32, 2048]
+    # Project [B, 32, 1536] -> [B, 32, 2048]
+    with torch.inference_mode():
+        latents_proj = mm_proj(latents_raw)
 
-    return latents_proj, target_ids_list
+    return latents_proj.cpu()
 
+
+# ---------------------------------------------------------------------------
+# Shard saving
+# ---------------------------------------------------------------------------
 
 def save_shard(shard_data, output_dir, shard_idx):
-    """Save a shard as a .pt file."""
     path = os.path.join(output_dir, f"shard_{shard_idx:05d}.pt")
     torch.save(shard_data, path)
     return path
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
         description="Precompute C3 encoder latents for all examples")
-    parser.add_argument("--data_path", type=str, required=True,
-                        help="Path to JSONL data file")
-    parser.add_argument("--model_name", type=str,
+    parser.add_argument("--data_path",   type=str, required=True)
+    parser.add_argument("--model_name",  type=str,
                         default="liufanfanlff/C3-Context-Cascade-Compression")
-    parser.add_argument("--output_dir", type=str, required=True,
-                        help="Directory to save .pt shards")
-    parser.add_argument("--shard_size", type=int, default=1000,
-                        help="Examples per shard file")
-    parser.add_argument("--batch_size", type=int, default=32,
-                        help="Encoder batch size")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--output_dir",  type=str, required=True)
+    parser.add_argument("--shard_size",  type=int, default=1000)
+    parser.add_argument("--batch_size",  type=int, default=128,
+                        help="GPU encoder batch size. H100 can handle 128-256.")
+    parser.add_argument("--device",      type=str, default="cuda")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    model, tokenizer = load_model(args.model_name, device=args.device)
-
-    # Read all examples
-    print(f"Reading data from {args.data_path}...")
+    # --- Read data ---
+    print(f"Reading {args.data_path}...")
     examples = []
     with open(args.data_path) as f:
         for line in f:
             examples.append(json.loads(line))
     print(f"Loaded {len(examples)} examples.")
 
-    # Process in batches, save in shards
-    shard_data = []
-    shard_idx = 0
-    total_processed = 0
+    # --- Load model ---
+    model, tokenizer = load_model(args.model_name, device=args.device)
+    latent_len = model.config.latent_token_len  # 32
 
-    for batch_start in range(0, len(examples), args.batch_size):
-        batch_end = min(batch_start + args.batch_size, len(examples))
-        batch_texts = [ex["text"] for ex in examples[batch_start:batch_end]]
+    # --- Pre-tokenize all data (CPU, done once) ---
+    print("\nPre-tokenizing all data...")
+    ctx_ids_list, target_ids_list = pretokenize_all(
+        tokenizer, examples, latent_len)
 
-        latents_proj, target_ids_list = encode_batch(
-            model, tokenizer, batch_texts, device=args.device)
+    # --- Sort by context length for minimal padding waste ---
+    order = sorted(range(len(examples)), key=lambda i: len(ctx_ids_list[i]))
+    ctx_ids_list    = [ctx_ids_list[i]    for i in order]
+    target_ids_list = [target_ids_list[i] for i in order]
+    print("Sorted by length.")
 
-        for i in range(len(batch_texts)):
-            shard_data.append({
-                "latents": latents_proj[i].cpu(),       # [32, 2048] bf16
-                "target_ids": target_ids_list[i].cpu(), # [L] int64
+    # --- Run encoder in batches ---
+    print(f"\nRunning encoder (batch_size={args.batch_size})...")
+    shard_buf      = []
+    shard_idx      = 0
+    total_done     = 0
+    t_gpu_start    = time.time()
+
+    for start in range(0, len(examples), args.batch_size):
+        end   = min(start + args.batch_size, len(examples))
+        batch_ctx = ctx_ids_list[start:end]
+        batch_tgt = target_ids_list[start:end]
+
+        latents = encode_batch(model, batch_ctx, device=args.device)  # [B, 32, 2048]
+
+        for i in range(len(batch_ctx)):
+            shard_buf.append({
+                "latents":    latents[i],       # [32, 2048] bfloat16, CPU
+                "target_ids": batch_tgt[i],     # [L] int64, CPU
             })
+            if len(shard_buf) >= args.shard_size:
+                path = save_shard(shard_buf, args.output_dir, shard_idx)
+                shard_idx  += 1
+                total_done += len(shard_buf)
+                elapsed     = time.time() - t_gpu_start
+                rate        = total_done / elapsed
+                eta         = (len(examples) - total_done) / rate
+                print(f"  {path}  |  {total_done}/{len(examples)}"
+                      f"  |  {rate:.0f} ex/s  |  ETA {eta/60:.1f} min")
+                shard_buf = []
 
-            if len(shard_data) >= args.shard_size:
-                path = save_shard(shard_data, args.output_dir, shard_idx)
-                shard_idx += 1
-                total_processed += len(shard_data)
-                print(f"  Saved {path} ({total_processed}/{len(examples)} processed)")
-                shard_data = []
+    if shard_buf:
+        path = save_shard(shard_buf, args.output_dir, shard_idx)
+        total_done += len(shard_buf)
+        print(f"  {path}  |  {total_done}/{len(examples)}")
 
-    # Save remaining
-    if shard_data:
-        path = save_shard(shard_data, args.output_dir, shard_idx)
-        total_processed += len(shard_data)
-        print(f"  Saved {path} ({total_processed}/{len(examples)} processed)")
-
-    print(f"\nDone. {total_processed} examples saved across {shard_idx + 1} shards "
-          f"in {args.output_dir}")
+    elapsed = time.time() - t_gpu_start
+    print(f"\nDone. {total_done} examples in {elapsed/60:.1f} min "
+          f"({total_done/elapsed:.0f} ex/s avg)  ->  {args.output_dir}")
 
 
 if __name__ == "__main__":
