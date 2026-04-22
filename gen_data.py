@@ -31,8 +31,14 @@ def gen_arithmetic_chain(rng, tokenizer, min_tok, max_tok):
             operand = rng.randint(1, 9999)
             result = val + operand
         elif op == "-":
-            operand = rng.randint(1, min(val, 9999))  # keep non-negative
-            result = val - operand
+            if val <= 1:
+                # Can't subtract; fall through to addition
+                op = "+"
+                operand = rng.randint(1, 9999)
+                result = val + operand
+            else:
+                operand = rng.randint(1, min(val - 1, 9999))  # keep result >= 1
+                result = val - operand
         else:  # *
             operand = rng.randint(2, 20)  # keep numbers manageable
             result = val * operand
