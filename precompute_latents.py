@@ -258,12 +258,24 @@ def main():
     n_local = len(ctx_ids_list)
     print(f"[rank {args.rank}] {n_local} examples, sorted by length.")
 
+    # --- Resume: skip already-completed shards ---
+    import glob as _glob
+    existing = sorted(_glob.glob(
+        os.path.join(args.output_dir, f"rank{args.rank:02d}_shard_*.pt")))
+    n_existing = len(existing)
+    skip = n_existing * args.shard_size
+    if skip > 0:
+        print(f"[rank {args.rank}] Resuming: {n_existing} shards already done, "
+              f"skipping first {skip} examples.")
+    ctx_ids_list    = ctx_ids_list[skip:]
+    target_ids_list = target_ids_list[skip:]
+
     # --- Run encoder ---
     print(f"\n[rank {args.rank}] Running encoder "
           f"(batch_size={args.batch_size}, compile={args.compile})...")
     shard_buf    = []
-    shard_idx    = 0
-    total_done   = 0
+    shard_idx    = n_existing
+    total_done   = skip
     pending_save = None   # most recent async save Future
     t0           = time.time()
 
