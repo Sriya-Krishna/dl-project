@@ -1,297 +1,404 @@
 """
-gen_data.py — Generate synthetic arithmetic and logic chain data for MTP training.
+gen_data.py -- Generate synthetic arithmetic and logic chain data for MTP training.
 
 Produces JSONL files with controllable token length (100-1300 tokens via Qwen tokenizer).
 500K training examples + 5K eval examples at evenly distributed lengths.
+
+Speedups vs naive version:
+  - Estimate-then-trim: generate full chain in one shot, tokenize ONCE to verify,
+    trim trailing steps if over budget. Eliminates per-step tokenizer calls.
+  - Multiprocessing: one worker per CPU core, each with its own tokenizer instance.
+  - Batch JSONL write at the end.
+
+Usage:
+    python gen_data.py                        # defaults: 500K train, 5K eval
+    python gen_data.py --num_workers 32       # tune to CPU core count
 """
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import random
-from pathlib import Path
-
-from transformers import AutoTokenizer
+import time
 
 
 # ---------------------------------------------------------------------------
-# Arithmetic chain generator
+# Worker-level globals (initialized once per process)
 # ---------------------------------------------------------------------------
 
-def gen_arithmetic_chain(rng, tokenizer, min_tok, max_tok):
-    """Build an arithmetic chain like '234 + 567 = 801, 801 * 2 = 1602, ...'"""
-    ops = ["+", "-", "*"]
-    val = rng.randint(1, 9999)
-    parts = [str(val)]
-    text = str(val)
+_tokenizer = None
 
-    for _ in range(500):  # upper bound on chain length
-        op = rng.choice(ops)
-        if op == "+":
+
+def _init_worker(tokenizer_name):
+    global _tokenizer
+    from transformers import AutoTokenizer
+    _tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name, trust_remote_code=True)
+
+
+def _tok_len(text):
+    return len(_tokenizer.encode(text, add_special_tokens=False))
+
+
+# ---------------------------------------------------------------------------
+# Arithmetic chain — estimate then trim
+# ---------------------------------------------------------------------------
+
+# Empirical: ", 1234 + 567 = 1801" encodes to ~8 tokens on Qwen.
+# Numbers with more digits encode to slightly more. We use 9 as a
+# conservative over-estimate so we never fall short.
+_ARITH_TOKENS_PER_STEP = 9
+
+
+def _arith_step(rng, val):
+    """Generate one arithmetic step. Returns (op_str, new_val)."""
+    choice = rng.randint(0, 2)
+    if choice == 0:
+        operand = rng.randint(1, 9999)
+        return f", {val} + {operand} = {val + operand}", val + operand
+    elif choice == 1:
+        if val <= 1:
             operand = rng.randint(1, 9999)
-            result = val + operand
-        elif op == "-":
-            if val <= 1:
-                # Can't subtract; fall through to addition
-                op = "+"
-                operand = rng.randint(1, 9999)
-                result = val + operand
-            else:
-                operand = rng.randint(1, min(val - 1, 9999))  # keep result >= 1
-                result = val - operand
-        else:  # *
-            operand = rng.randint(2, 20)  # keep numbers manageable
-            result = val * operand
+            return f", {val} + {operand} = {val + operand}", val + operand
+        operand = rng.randint(1, min(val - 1, 9999))
+        return f", {val} - {operand} = {val - operand}", val - operand
+    else:
+        operand = rng.randint(2, 20)
+        return f", {val} * {operand} = {val * operand}", val * operand
 
-        step = f", {val} {op} {operand} = {result}"
-        candidate = text + step
-        tok_len = len(tokenizer.encode(candidate))
 
-        if tok_len > max_tok:
+def gen_arithmetic(rng, target_min, target_max):
+    """
+    Generate arithmetic chain targeting [target_min, target_max] tokens.
+    Tokenizes exactly ONCE (at the end). Trims from the tail if over budget.
+    """
+    target = rng.randint(target_min, target_max)
+    n_steps = max(1, target // _ARITH_TOKENS_PER_STEP)
+
+    val = rng.randint(1, 9999)
+    steps = [str(val)]
+    for _ in range(n_steps + 10):  # small buffer in case estimate is short
+        step_str, val = _arith_step(rng, val)
+        steps.append(step_str)
+
+    # Build text and trim from the tail until we're within budget
+    text = "".join(steps)
+    tok = _tok_len(text)
+
+    while tok > target_max and len(steps) > 1:
+        steps.pop()
+        text = "".join(steps)
+        tok = _tok_len(text)
+
+    # If still too short, add more steps one at a time
+    while tok < target_min:
+        step_str, val = _arith_step(rng, val)
+        steps.append(step_str)
+        text = "".join(steps)
+        tok = _tok_len(text)
+        if tok > target_max:
+            steps.pop()
+            text = "".join(steps)
+            tok = _tok_len(text)
             break
-        text = candidate
-        val = result
 
-        if tok_len >= min_tok:
-            # Randomly decide to stop (30% chance) once we're in range
-            if rng.random() < 0.3:
-                break
-
-    return text
-
-
-def gen_arithmetic_chain_targeted(rng, tokenizer, target_min, target_max,
-                                  max_retries=20):
-    """Generate an arithmetic chain within a specific token length range."""
-    for _ in range(max_retries):
-        text = gen_arithmetic_chain(rng, tokenizer, target_min, target_max)
-        tok_len = len(tokenizer.encode(text))
-        if target_min <= tok_len <= target_max:
-            return text, tok_len
+    if target_min <= tok <= target_max:
+        return text, tok
     return None, 0
 
 
 # ---------------------------------------------------------------------------
-# Logic chain generator
+# Logic chain -- estimate then trim
 # ---------------------------------------------------------------------------
+
+_LOGIC_TOKENS_PER_PROP = 7   # "If A then B. " ~ 6 tokens; derivation ~ 5
 
 PROP_NAMES = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 
-def gen_logic_chain(rng, tokenizer, min_tok, max_tok):
-    """Build a logic chain like 'If A then B. If B then C. A is true. Therefore C is true.'"""
-    n_props = rng.randint(3, min(15, len(PROP_NAMES)))
-    props = rng.sample(PROP_NAMES, n_props)
-
-    # Build implication chain: props[0]->props[1]->...->props[-1]
+def _build_logic_text(props, rng):
+    """Assemble rules + premise + derivations for a list of propositions."""
     rules = []
     for i in range(len(props) - 1):
-        # Occasionally add compound conditions
         if rng.random() < 0.2 and i > 0:
             extra = rng.choice(props[:i])
             rules.append(f"If {props[i]} and {extra} then {props[i+1]}.")
         else:
             rules.append(f"If {props[i]} then {props[i+1]}.")
+    derivations = [f"Therefore {props[i]} is true." for i in range(1, len(props))]
+    return " ".join(rules) + f" {props[0]} is true. " + " ".join(derivations)
 
-    # Premise
-    premise = f"{props[0]} is true."
 
-    # Derivations
-    derivations = []
-    for i in range(1, len(props)):
-        derivations.append(f"Therefore {props[i]} is true.")
+def gen_logic(rng, target_min, target_max):
+    """
+    Generate a logic chain (or chain-of-chains for long targets).
+    Tokenizes exactly ONCE. Trims or extends prop list as needed.
+    """
+    target = rng.randint(target_min, target_max)
 
-    text = " ".join(rules) + " " + premise
-    for d in derivations:
-        candidate = text + " " + d
-        tok_len = len(tokenizer.encode(candidate))
-        if tok_len > max_tok:
+    # For long targets, chain multiple independent prop groups
+    n_total_props = max(4, target // _LOGIC_TOKENS_PER_PROP)
+
+    # Build propositions: short names for first 26, then P{i}_{j} style
+    def make_prop(idx):
+        if idx < 26:
+            return PROP_NAMES[idx]
+        group, pos = divmod(idx, 26)
+        return f"P{group}{PROP_NAMES[pos]}"
+
+    props = [make_prop(i) for i in range(n_total_props)]
+    rng.shuffle(props)
+
+    text = _build_logic_text(props, rng)
+    tok = _tok_len(text)
+
+    # Trim: remove props from the tail until within budget
+    while tok > target_max and len(props) > 3:
+        props = props[:-1]
+        text = _build_logic_text(props, rng)
+        tok = _tok_len(text)
+
+    # Extend: add props one at a time if too short
+    next_idx = len(props)
+    while tok < target_min:
+        props.append(make_prop(next_idx))
+        next_idx += 1
+        text = _build_logic_text(props, rng)
+        tok = _tok_len(text)
+        if tok > target_max:
+            props = props[:-1]
+            text = _build_logic_text(props, rng)
+            tok = _tok_len(text)
             break
-        text = candidate
-        if tok_len >= min_tok and rng.random() < 0.3:
-            break
 
-    return text
-
-
-def gen_logic_chain_targeted(rng, tokenizer, target_min, target_max,
-                             max_retries=20):
-    """Generate a logic chain within a specific token length range."""
-    for _ in range(max_retries):
-        text = gen_logic_chain(rng, tokenizer, target_min, target_max)
-        tok_len = len(tokenizer.encode(text))
-        if target_min <= tok_len <= target_max:
-            return text, tok_len
+    if target_min <= tok <= target_max:
+        return text, tok
     return None, 0
 
 
 # ---------------------------------------------------------------------------
-# Extended logic chain for longer sequences
+# Worker function (called by multiprocessing pool)
 # ---------------------------------------------------------------------------
 
-def gen_extended_logic_chain(rng, tokenizer, min_tok, max_tok):
-    """Generate multiple logic chain segments to reach longer token counts."""
-    segments = []
-    total_text = ""
+def _generate_batch(args):
+    """
+    Generate a batch of examples. Called in a worker process.
 
-    for seg_idx in range(50):  # up to 50 segments
-        n_props = rng.randint(4, 10)
-        base_names = [f"{c}{seg_idx}" if seg_idx > 0 else c
-                      for c in rng.sample(PROP_NAMES, min(n_props, len(PROP_NAMES)))]
-        # Ensure unique names
-        props = [f"P{seg_idx}_{i}" for i in range(n_props)] if seg_idx > 3 else base_names
+    args: (seeds, min_tok, max_tok, bin_ranges)
+      seeds      : list of int seeds, one per example
+      min_tok    : global min (used when bin_ranges is None)
+      max_tok    : global max
+      bin_ranges : list of (lo, hi) per example, or None for uniform sampling
+    """
+    seeds, min_tok, max_tok, bin_ranges = args
+    results = []
 
-        rules = []
-        for i in range(len(props) - 1):
-            rules.append(f"If {props[i]} then {props[i+1]}.")
+    for i, seed in enumerate(seeds):
+        rng = random.Random(seed)
+        lo = bin_ranges[i][0] if bin_ranges else min_tok
+        hi = bin_ranges[i][1] if bin_ranges else max_tok
 
-        premise = f"{props[0]} is true."
-        derivations = [f"Therefore {props[i]} is true." for i in range(1, len(props))]
+        dtype = rng.choice(["arithmetic", "logic"])
+        if dtype == "arithmetic":
+            text, tok = gen_arithmetic(rng, lo, hi)
+        else:
+            text, tok = gen_logic(rng, lo, hi)
 
-        segment = " ".join(rules) + " " + premise + " " + " ".join(derivations)
-        candidate = (total_text + " " + segment).strip()
-        tok_len = len(tokenizer.encode(candidate))
-
-        if tok_len > max_tok:
-            break
-        total_text = candidate
-        if tok_len >= min_tok and rng.random() < 0.3:
-            break
-
-    return total_text
-
-
-# ---------------------------------------------------------------------------
-# Main generation logic
-# ---------------------------------------------------------------------------
-
-def generate_example(rng, tokenizer, min_tok, max_tok):
-    """Generate a single example within the token length range."""
-    dtype = rng.choice(["arithmetic", "logic"])
-
-    if dtype == "arithmetic":
-        text, tok_len = gen_arithmetic_chain_targeted(
-            rng, tokenizer, min_tok, max_tok)
+        # Fallback to the other type if first failed
         if text is None:
-            # Fallback to logic
-            dtype = "logic"
+            if dtype == "arithmetic":
+                text, tok = gen_logic(rng, lo, hi)
+                dtype = "logic"
+            else:
+                text, tok = gen_arithmetic(rng, lo, hi)
+                dtype = "arithmetic"
 
-    if dtype == "logic":
-        text, tok_len = gen_logic_chain_targeted(
-            rng, tokenizer, min_tok, max_tok)
-        if text is None:
-            # Try extended logic for longer targets
-            text = gen_extended_logic_chain(rng, tokenizer, min_tok, max_tok)
-            tok_len = len(tokenizer.encode(text))
-            if not (min_tok <= tok_len <= max_tok):
-                return None
+        if text is not None and lo <= tok <= hi:
+            results.append({"text": text, "type": dtype, "token_count": tok})
+        else:
+            results.append(None)
 
-    return {"text": text, "type": dtype, "token_count": tok_len}
+    return results
 
 
-def generate_train_set(rng, tokenizer, num_examples, min_tok, max_tok):
-    """Generate training examples with token lengths distributed across the range."""
-    examples = []
+# ---------------------------------------------------------------------------
+# Parallel generation
+# ---------------------------------------------------------------------------
+
+def generate_parallel(num_examples, min_tok, max_tok, base_seed,
+                      num_workers, tokenizer_name,
+                      bin_ranges=None, chunk_size=500):
+    """
+    Generate num_examples examples using a multiprocessing pool.
+
+    bin_ranges: list of (lo, hi) per example for eval binning, or None.
+    """
+    # Pre-generate seeds so results are fully reproducible
+    master_rng = random.Random(base_seed)
+    seeds = [master_rng.randint(0, 2**31) for _ in range(num_examples * 2)]
+
+    pool = mp.Pool(
+        processes=num_workers,
+        initializer=_init_worker,
+        initargs=(tokenizer_name,),
+    )
+
+    results = []
+    seed_idx = 0
+    t0 = time.time()
     attempts = 0
-    max_attempts = num_examples * 5
 
-    while len(examples) < num_examples and attempts < max_attempts:
-        attempts += 1
-        ex = generate_example(rng, tokenizer, min_tok, max_tok)
-        if ex is not None:
-            examples.append(ex)
-            if len(examples) % 10000 == 0:
-                print(f"  Generated {len(examples)}/{num_examples} train examples "
-                      f"({attempts} attempts)")
+    while len(results) < num_examples:
+        needed = num_examples - len(results)
+        # Build chunks for this round
+        chunks = []
+        for _ in range(0, min(needed * 2, num_examples * 2 - seed_idx), chunk_size):
+            if seed_idx >= len(seeds):
+                # Extend seeds if needed (rare)
+                seeds.extend(master_rng.randint(0, 2**31)
+                             for _ in range(chunk_size))
+            batch_seeds = seeds[seed_idx: seed_idx + chunk_size]
+            seed_idx += chunk_size
 
-    return examples
+            if bin_ranges is not None:
+                batch_bins = bin_ranges[len(results): len(results) + len(batch_seeds)]
+                # Pad if list is exhausted (shouldn't happen in normal use)
+                while len(batch_bins) < len(batch_seeds):
+                    batch_bins.append((min_tok, max_tok))
+            else:
+                batch_bins = None
+
+            chunks.append((batch_seeds, min_tok, max_tok, batch_bins))
+            attempts += len(batch_seeds)
+
+            if len(results) + len(chunks) * chunk_size >= num_examples:
+                break
+
+        for batch_results in pool.map(_generate_batch, chunks):
+            for ex in batch_results:
+                if ex is not None and len(results) < num_examples:
+                    results.append(ex)
+
+        elapsed = time.time() - t0
+        rate = len(results) / elapsed if elapsed > 0 else 0
+        print(f"  {len(results)}/{num_examples}  ({rate:.0f} ex/s, "
+              f"{attempts} attempts)")
+
+        if attempts > num_examples * 10:
+            print("  Warning: high attempt count — check token range settings.")
+            break
+
+    pool.close()
+    pool.join()
+    return results[:num_examples]
 
 
-def generate_eval_set(rng, tokenizer, num_examples, min_tok, max_tok):
-    """Generate eval examples with lengths evenly distributed across bins."""
-    bin_width = 50
+# ---------------------------------------------------------------------------
+# Eval bin assignment
+# ---------------------------------------------------------------------------
+
+def make_eval_bin_ranges(num_examples, min_tok, max_tok, bin_width=50):
+    """Assign each eval example to a length bin for uniform length distribution."""
     bins = list(range(min_tok, max_tok, bin_width))
-    examples_per_bin = max(1, num_examples // len(bins))
-    remainder = num_examples - examples_per_bin * len(bins)
+    n_bins = len(bins)
+    per_bin = max(1, num_examples // n_bins)
+    remainder = num_examples - per_bin * n_bins
 
-    examples = []
-    for i, bin_start in enumerate(bins):
-        bin_end = min(bin_start + bin_width, max_tok)
-        target_count = examples_per_bin + (1 if i < remainder else 0)
-        bin_examples = []
-        attempts = 0
+    ranges = []
+    for i, lo in enumerate(bins):
+        hi = min(lo + bin_width, max_tok)
+        count = per_bin + (1 if i < remainder else 0)
+        ranges.extend([(lo, hi)] * count)
 
-        while len(bin_examples) < target_count and attempts < target_count * 20:
-            attempts += 1
-            ex = generate_example(rng, tokenizer, bin_start, bin_end)
-            if ex is not None:
-                bin_examples.append(ex)
+    # Shuffle so workers get a mix of easy/hard bins
+    random.Random(0).shuffle(ranges)
+    return ranges[:num_examples]
 
-        examples.extend(bin_examples)
-        if (i + 1) % 5 == 0:
-            print(f"  Eval bins completed: {i + 1}/{len(bins)}, "
-                  f"total examples: {len(examples)}")
 
-    return examples
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Generate synthetic training data")
-    parser.add_argument("--output_train", type=str, default="data/train.jsonl")
-    parser.add_argument("--output_eval", type=str, default="data/eval.jsonl")
-    parser.add_argument("--num_train", type=int, default=500_000)
-    parser.add_argument("--num_eval", type=int, default=5_000)
-    parser.add_argument("--min_tokens", type=int, default=100)
-    parser.add_argument("--max_tokens", type=int, default=1300)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--tokenizer", type=str,
+    parser.add_argument("--output_train",  type=str, default="data/train.jsonl")
+    parser.add_argument("--output_eval",   type=str, default="data/eval.jsonl")
+    parser.add_argument("--num_train",     type=int, default=500_000)
+    parser.add_argument("--num_eval",      type=int, default=5_000)
+    parser.add_argument("--min_tokens",    type=int, default=100)
+    parser.add_argument("--max_tokens",    type=int, default=1300)
+    parser.add_argument("--seed",          type=int, default=42)
+    parser.add_argument("--tokenizer",     type=str,
                         default="liufanfanlff/C3-Context-Cascade-Compression")
+    parser.add_argument("--num_workers",   type=int,
+                        default=max(1, mp.cpu_count() - 1),
+                        help="Worker processes (default: nCPU-1)")
+    parser.add_argument("--chunk_size",    type=int, default=500,
+                        help="Examples per pool task")
     args = parser.parse_args()
 
-    print(f"Loading tokenizer from {args.tokenizer}...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer, trust_remote_code=True)
-
-    rng = random.Random(args.seed)
+    print(f"Workers: {args.num_workers}  |  chunk_size: {args.chunk_size}")
+    print(f"Tokenizer: {args.tokenizer}")
 
     # --- Training set ---
     print(f"\nGenerating {args.num_train} training examples "
           f"[{args.min_tokens}-{args.max_tokens} tokens]...")
-    train_examples = generate_train_set(
-        rng, tokenizer, args.num_train, args.min_tokens, args.max_tokens)
+    t0 = time.time()
+    train_examples = generate_parallel(
+        num_examples=args.num_train,
+        min_tok=args.min_tokens,
+        max_tok=args.max_tokens,
+        base_seed=args.seed,
+        num_workers=args.num_workers,
+        tokenizer_name=args.tokenizer,
+        bin_ranges=None,
+        chunk_size=args.chunk_size,
+    )
+    print(f"Train generation done in {time.time()-t0:.0f}s")
 
     os.makedirs(os.path.dirname(args.output_train) or ".", exist_ok=True)
     with open(args.output_train, "w") as f:
         for ex in train_examples:
             f.write(json.dumps(ex) + "\n")
-    print(f"Wrote {len(train_examples)} training examples to {args.output_train}")
+    print(f"Wrote {len(train_examples)} examples to {args.output_train}")
 
     # --- Eval set ---
     print(f"\nGenerating {args.num_eval} eval examples "
-          f"(evenly distributed across length bins)...")
-    eval_examples = generate_eval_set(
-        rng, tokenizer, args.num_eval, args.min_tokens, args.max_tokens)
+          f"(evenly distributed across {args.min_tokens}-{args.max_tokens} tokens)...")
+    eval_bin_ranges = make_eval_bin_ranges(
+        args.num_eval, args.min_tokens, args.max_tokens)
+    t0 = time.time()
+    eval_examples = generate_parallel(
+        num_examples=args.num_eval,
+        min_tok=args.min_tokens,
+        max_tok=args.max_tokens,
+        base_seed=args.seed + 1,
+        num_workers=args.num_workers,
+        tokenizer_name=args.tokenizer,
+        bin_ranges=eval_bin_ranges,
+        chunk_size=args.chunk_size,
+    )
+    print(f"Eval generation done in {time.time()-t0:.0f}s")
 
     os.makedirs(os.path.dirname(args.output_eval) or ".", exist_ok=True)
     with open(args.output_eval, "w") as f:
         for ex in eval_examples:
             f.write(json.dumps(ex) + "\n")
-    print(f"Wrote {len(eval_examples)} eval examples to {args.output_eval}")
+    print(f"Wrote {len(eval_examples)} examples to {args.output_eval}")
 
-    # --- Quick stats ---
+    # --- Stats ---
     for name, exs in [("Train", train_examples), ("Eval", eval_examples)]:
         if not exs:
             continue
         lengths = [e["token_count"] for e in exs]
-        types = [e["type"] for e in exs]
-        n_arith = sum(1 for t in types if t == "arithmetic")
-        n_logic = sum(1 for t in types if t == "logic")
-        print(f"\n{name} stats:")
-        print(f"  Total: {len(exs)}")
-        print(f"  Arithmetic: {n_arith}, Logic: {n_logic}")
-        print(f"  Token length — min: {min(lengths)}, max: {max(lengths)}, "
-              f"mean: {sum(lengths)/len(lengths):.0f}")
+        n_arith = sum(1 for e in exs if e["type"] == "arithmetic")
+        print(f"\n{name} stats: total={len(exs)} | "
+              f"arithmetic={n_arith} logic={len(exs)-n_arith} | "
+              f"len min={min(lengths)} max={max(lengths)} "
+              f"mean={sum(lengths)/len(lengths):.0f}")
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()
