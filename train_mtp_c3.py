@@ -6,6 +6,14 @@ train_mtp_c3.py -- LoRA fine-tune the C3 decoder with a shared-weight MTP head.
 - Adds a single MTP head (2-layer MLP), unrolled K times per position
 - Loss = standard next-token CE + (1/K) * mean(MTP offset CEs)
 - Bypasses C3 encoder path by calling Qwen2Model.forward() directly
+
+Auto-resume: on startup, automatically finds and resumes from the latest checkpoint
+in --save_dir (highest step_XXXXX directory). No --resume_from flag needed.
+
+Epoch-seeded sampler: LengthBucketSampler uses seed + epoch, so batch order is
+reproducible across crashes — same epoch always produces the same batch order.
+On resume, fast-forwards through already-processed batches in the current epoch
+(data is in RAM, so this loop is essentially free — no GPU work).
 """
 
 import argparse
@@ -45,7 +53,6 @@ class MTPHead(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, x):
-        # x: [B, S, D] or [B, D]
         return self.fc2(self.act(self.fc1(self.norm(x))))
 
 
@@ -54,10 +61,16 @@ class MTPHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class LatentDataset(Dataset):
-    """Loads all .pt shards into RAM. Each item: {latents, target_ids}."""
+    """Loads all .pt shards into RAM. Each item: {latents, target_ids}.
+
+    Accepts both old-style shard_*.pt and new-style rank*_shard_*.pt filenames.
+    """
 
     def __init__(self, latent_dir):
-        shard_paths = sorted(glob.glob(os.path.join(latent_dir, "shard_*.pt")))
+        shard_paths = sorted(
+            glob.glob(os.path.join(latent_dir, "shard_*.pt")) +
+            glob.glob(os.path.join(latent_dir, "rank*_shard_*.pt"))
+        )
         assert shard_paths, f"No shards found in {latent_dir}"
         print(f"Loading {len(shard_paths)} shards from {latent_dir}...")
         self.data = []
@@ -74,32 +87,47 @@ class LatentDataset(Dataset):
 
 
 class LengthBucketSampler(Sampler):
-    """Groups examples by target_ids length to minimize padding waste."""
+    """Groups examples by target_ids length to minimize padding waste.
 
-    def __init__(self, dataset, batch_size, shuffle=True):
+    Deterministic per epoch: shuffle seed = base_seed + epoch, so the same
+    epoch always produces the same batch order regardless of crash/restart.
+    """
+
+    def __init__(self, dataset, batch_size, shuffle=True, seed=0):
         self.batch_size = batch_size
         self.shuffle = shuffle
-        # Sort indices by target sequence length
-        self.lengths = [len(d["target_ids"]) for d in dataset.data]
-        self.sorted_indices = sorted(range(len(dataset)), key=lambda i: self.lengths[i])
+        self.seed = seed
+        self._epoch = 0
+        lengths = [len(d["target_ids"]) for d in dataset.data]
+        self.sorted_indices = sorted(range(len(dataset)), key=lambda i: lengths[i])
+        # Pre-build sorted batches (order within each batch is fixed)
+        self._batches = []
+        for i in range(0, len(self.sorted_indices), batch_size):
+            b = self.sorted_indices[i:i + batch_size]
+            if len(b) == batch_size:  # drop_last equivalent
+                self._batches.append(b)
+
+    def set_epoch(self, epoch):
+        self._epoch = epoch
 
     def __iter__(self):
-        # Create batches from sorted indices
-        batches = []
-        for i in range(0, len(self.sorted_indices), self.batch_size):
-            batch = self.sorted_indices[i:i + self.batch_size]
-            batches.append(batch)
         if self.shuffle:
-            # Shuffle the order of batches (not within batches)
             g = torch.Generator()
-            perm = torch.randperm(len(batches), generator=g).tolist()
-            batches = [batches[i] for i in perm]
+            g.manual_seed(self.seed + self._epoch)
+            perm = torch.randperm(len(self._batches), generator=g).tolist()
+            batches = [self._batches[i] for i in perm]
+        else:
+            batches = self._batches
         for batch in batches:
             yield from batch
 
     def __len__(self):
-        return len(self.sorted_indices)
+        return len(self._batches) * self.batch_size
 
+
+# ---------------------------------------------------------------------------
+# Collate
+# ---------------------------------------------------------------------------
 
 def collate_fn(batch):
     """Pad target_ids to max length in batch with -100, stack latents."""
@@ -143,7 +171,6 @@ def train_step(batch, model, mtp_head, prompt_ids, K, device):
     inputs_embeds = torch.cat([latents, prompt_embeds, target_embeds], dim=1)
 
     # Attention mask: 1 for real positions, 0 for padding
-    L = target_ids.shape[1]
     latent_mask = torch.ones(B, 32, device=device, dtype=torch.long)
     prompt_mask = torch.ones(B, P, device=device, dtype=torch.long)
     target_mask = (target_ids != -100).long()
@@ -186,7 +213,6 @@ def train_step(batch, model, mtp_head, prompt_ids, K, device):
         mtp_logits = lm_head(Z)  # [B, S, V]
         shift = k + 2  # MTP depth k predicts token at position i + k + 2
         if shift >= labels.shape[1]:
-            # Sequence too short for this depth, skip
             mtp_losses.append(torch.tensor(0.0, device=device))
             continue
         s_logits = mtp_logits[:, :-shift, :].contiguous()
@@ -206,18 +232,38 @@ def train_step(batch, model, mtp_head, prompt_ids, K, device):
 # Checkpoint utilities
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, mtp_head, optimizer, scheduler, step, args, save_dir):
+def find_latest_checkpoint(save_dir):
+    """Scan save_dir for step_XXXXX directories, return path with highest step.
+
+    Returns None if save_dir doesn't exist or contains no valid checkpoints.
+    """
+    if not os.path.exists(save_dir):
+        return None
+    candidates = []
+    for name in os.listdir(save_dir):
+        if name.startswith("step_") and name[5:].isdigit():
+            step_num = int(name[5:])
+            ckpt_path = os.path.join(save_dir, name)
+            # Verify it's a usable checkpoint (has training_state.pt)
+            if os.path.exists(os.path.join(ckpt_path, "training_state.pt")):
+                candidates.append((step_num, ckpt_path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
+
+
+def save_checkpoint(model, mtp_head, optimizer, scheduler,
+                    step, epoch, args, save_dir):
     """Save LoRA adapter, MTP head, optimizer, and training state."""
     os.makedirs(save_dir, exist_ok=True)
-    # LoRA adapter
     model.save_pretrained(os.path.join(save_dir, "lora_adapter"))
-    # MTP head
     torch.save(mtp_head.state_dict(), os.path.join(save_dir, "mtp_head.pt"))
-    # Training state
     torch.save({
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler else None,
         "step": step,
+        "epoch": epoch,
         "mtp_k": args.mtp_k,
         "lr": args.lr,
     }, os.path.join(save_dir, "training_state.pt"))
@@ -225,25 +271,24 @@ def save_checkpoint(model, mtp_head, optimizer, scheduler, step, args, save_dir)
 
 
 def load_checkpoint(model, mtp_head, optimizer, scheduler, checkpoint_dir, device):
-    """Load a saved checkpoint. Returns the step number."""
-    from peft import PeftModel
-    # LoRA adapter
+    """Load a saved checkpoint. Returns (step, epoch)."""
     lora_dir = os.path.join(checkpoint_dir, "lora_adapter")
     if os.path.exists(lora_dir):
         model.load_adapter(lora_dir, adapter_name="default")
-    # MTP head
+
     mtp_path = os.path.join(checkpoint_dir, "mtp_head.pt")
     if os.path.exists(mtp_path):
-        mtp_head.load_state_dict(torch.load(mtp_path, map_location=device, weights_only=True))
-    # Training state
+        mtp_head.load_state_dict(
+            torch.load(mtp_path, map_location=device, weights_only=True))
+
     state_path = os.path.join(checkpoint_dir, "training_state.pt")
     if os.path.exists(state_path):
         state = torch.load(state_path, map_location=device, weights_only=True)
         optimizer.load_state_dict(state["optimizer"])
         if scheduler and state.get("scheduler"):
             scheduler.load_state_dict(state["scheduler"])
-        return state["step"]
-    return 0
+        return state["step"], state.get("epoch", 0)
+    return 0, 0
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +323,8 @@ def main():
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--prompt", type=str, default="Repeat the text: ")
-    parser.add_argument("--resume_from", type=str, default=None,
-                        help="Checkpoint directory to resume from")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Base seed for sampler reproducibility")
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
@@ -292,7 +337,6 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name, trust_remote_code=True)
 
-    # Tokenize the fixed prompt
     prompt_ids = torch.tensor(
         tokenizer.encode(args.prompt), dtype=torch.long, device=device)
     print(f"Prompt: '{args.prompt}' -> {len(prompt_ids)} tokens")
@@ -303,7 +347,7 @@ def main():
         args.model_name,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         device_map="auto",
         use_safetensors=True,
         pad_token_id=tokenizer.eos_token_id,
@@ -336,9 +380,10 @@ def main():
     mtp_head = MTPHead(hidden_dim=hidden_dim).to(device=device, dtype=torch.bfloat16)
     print(f"MTP head params: {sum(p.numel() for p in mtp_head.parameters()):,}")
 
-    # --- Dataset ---
+    # --- Dataset + sampler ---
     dataset = LatentDataset(args.latent_dir)
-    sampler = LengthBucketSampler(dataset, args.batch_size, shuffle=True)
+    sampler = LengthBucketSampler(
+        dataset, args.batch_size, shuffle=True, seed=args.seed)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -348,6 +393,7 @@ def main():
         pin_memory=True,
         drop_last=True,
     )
+    steps_per_epoch = len(sampler._batches)  # exact: pre-built batches count
 
     # --- Optimizer & scheduler ---
     trainable_params = (
@@ -357,29 +403,44 @@ def main():
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
     scheduler = get_cosine_schedule(optimizer, args.warmup_steps, args.max_steps)
 
-    # --- Resume from checkpoint ---
+    # --- Auto-resume: find latest checkpoint ---
     start_step = 0
-    if args.resume_from and os.path.exists(args.resume_from):
-        print(f"Resuming from {args.resume_from}...")
-        start_step = load_checkpoint(
-            model, mtp_head, optimizer, scheduler, args.resume_from, device)
-        print(f"Resumed at step {start_step}")
+    start_epoch = 0
+    latest_ckpt = find_latest_checkpoint(args.save_dir)
+    if latest_ckpt:
+        print(f"Auto-resuming from {latest_ckpt}...")
+        start_step, start_epoch = load_checkpoint(
+            model, mtp_head, optimizer, scheduler, latest_ckpt, device)
+        print(f"Resumed at step={start_step}, epoch={start_epoch}")
+    else:
+        print("No checkpoint found — starting from scratch.")
+
+    # Compute how far into start_epoch we already were
+    steps_done_in_start_epoch = start_step - start_epoch * steps_per_epoch
+    steps_done_in_start_epoch = max(0, steps_done_in_start_epoch)
 
     # --- Training loop ---
     print(f"\nStarting training: K={args.mtp_k}, lr={args.lr}, "
           f"batch_size={args.batch_size}, max_steps={args.max_steps}")
+    print(f"steps_per_epoch={steps_per_epoch}")
     print(f"{'='*80}")
 
     model.train()
     mtp_head.train()
     step = start_step
-    epoch = 0
     running_loss = 0.0
     t_start = time.time()
 
+    epoch = start_epoch
     while step < args.max_steps:
-        epoch += 1
-        for batch in dataloader:
+        sampler.set_epoch(epoch)
+
+        for batch_idx, batch in enumerate(dataloader):
+            # Fast-forward: skip batches already processed in this epoch.
+            # Data is in RAM, so enumerate is cheap — no GPU work happens here.
+            if epoch == start_epoch and batch_idx < steps_done_in_start_epoch:
+                continue
+
             if step >= args.max_steps:
                 break
 
@@ -418,12 +479,15 @@ def main():
             # --- Checkpointing ---
             if step % args.save_every == 0:
                 ckpt_dir = os.path.join(args.save_dir, f"step_{step}")
-                save_checkpoint(model, mtp_head, optimizer, scheduler, step,
-                                args, ckpt_dir)
+                save_checkpoint(model, mtp_head, optimizer, scheduler,
+                                step, epoch, args, ckpt_dir)
+
+        epoch += 1
 
     # Final checkpoint
     ckpt_dir = os.path.join(args.save_dir, f"step_{step}")
-    save_checkpoint(model, mtp_head, optimizer, scheduler, step, args, ckpt_dir)
+    save_checkpoint(model, mtp_head, optimizer, scheduler,
+                    step, epoch, args, ckpt_dir)
     print(f"\nTraining complete. Final step: {step}")
 
 
