@@ -1,0 +1,8 @@
+torch>=2.2.0
+transformers>=4.49.0
+peft>=0.13.0
+accelerate
+flash-attn>=2.5.0
+safetensors
+tiktoken
+python-Levenshtein
