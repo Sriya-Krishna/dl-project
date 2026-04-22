@@ -111,6 +111,8 @@ def encode_batch(model, tokenizer, texts, device="cuda"):
         h = last_hidden[i, pos + 1: pos + 1 + latent_len]  # [32, 1536]
         latents_raw.append(h)
     latents_raw = torch.stack(latents_raw)  # [B, 32, 1536]
+    # Cast to match mm_projector weight dtype (bfloat16) — llm1 may output float16
+    latents_raw = latents_raw.to(dtype=mm_proj.weight.dtype)
 
     # Project to decoder space
     with torch.no_grad():
