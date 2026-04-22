@@ -96,7 +96,7 @@ def load_model_for_evaluation(model_name, checkpoint_dir, device="cuda"):
         model_name,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         device_map=device,
         use_safetensors=True,
         pad_token_id=tokenizer.eos_token_id,
@@ -131,7 +131,10 @@ def load_model_for_evaluation(model_name, checkpoint_dir, device="cuda"):
 
 def load_shard_data(latent_dir):
     """Load all shards into a flat list."""
-    shard_paths = sorted(glob.glob(os.path.join(latent_dir, "shard_*.pt")))
+    shard_paths = sorted(
+        glob.glob(os.path.join(latent_dir, "shard_*.pt")) +
+        glob.glob(os.path.join(latent_dir, "rank*_shard_*.pt"))
+    )
     assert shard_paths, f"No shards found in {latent_dir}"
     data = []
     for path in shard_paths:

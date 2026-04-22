@@ -47,8 +47,8 @@ def load_model(model_name, device="cuda", compile_encoder=False):
         pad_token_id=tokenizer.eos_token_id,
     )
 
-    # Swap encoder for flash_attention_2 version
-    print("Reloading encoder with flash_attention_2...")
+    # Swap encoder for sdpa version (flash_attention_2 crashes on s_aux NoneType)
+    print("Reloading encoder with sdpa...")
     encoder_fa = Qwen2ForCausalLM.from_pretrained(
         model_name,
         subfolder="llm1",
@@ -275,7 +275,7 @@ def main():
           f"(batch_size={args.batch_size}, compile={args.compile})...")
     shard_buf    = []
     shard_idx    = n_existing
-    total_done   = skip
+    total_done   = 0      # only count examples processed in THIS run
     pending_save = None   # most recent async save Future
     t0           = time.time()
 
@@ -302,10 +302,11 @@ def main():
                 shard_idx  += 1
                 total_done += len(shard_buf)
                 elapsed     = time.time() - t0
-                rate        = total_done / elapsed
-                eta         = (n_local - total_done) / rate
+                rate        = total_done / elapsed if elapsed > 0 else 0
+                remaining   = n_local - total_done
+                eta         = remaining / rate if rate > 0 else 0
                 print(f"  [rank {args.rank}] {path} | "
-                      f"{total_done}/{n_local} | "
+                      f"{total_done + skip}/{n_local + skip} | "
                       f"{rate:.0f} ex/s | ETA {eta/60:.1f} min")
                 shard_buf = []
 
@@ -317,13 +318,13 @@ def main():
             shard_buf, args.output_dir, shard_idx, args.rank)
         future.result()
         total_done += len(shard_buf)
-        print(f"  [rank {args.rank}] {path} | {total_done}/{n_local}")
+        print(f"  [rank {args.rank}] {path} | {total_done + skip}/{n_local + skip}")
     elif pending_save is not None:
         pending_save.result()
 
     elapsed = time.time() - t0
-    print(f"\n[rank {args.rank}] Done. {total_done} examples in "
-          f"{elapsed/60:.1f} min ({total_done/elapsed:.0f} ex/s avg)")
+    print(f"\n[rank {args.rank}] Done. {total_done + skip} examples total in "
+          f"{elapsed/60:.1f} min ({total_done/elapsed:.0f} ex/s avg this run)")
 
 
 if __name__ == "__main__":

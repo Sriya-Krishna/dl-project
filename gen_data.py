@@ -265,6 +265,7 @@ def generate_parallel(num_examples, min_tok, max_tok, base_seed,
     while len(results) < num_examples:
         needed = num_examples - len(results)
         chunks = []
+        bin_offset = len(results)  # track how far into bin_ranges we've assigned
         for _ in range(0, min(needed * 2, num_examples * 2 - seed_idx), chunk_size):
             if seed_idx >= len(seeds):
                 seeds.extend(master_rng.randint(0, 2**31)
@@ -273,9 +274,10 @@ def generate_parallel(num_examples, min_tok, max_tok, base_seed,
             seed_idx += chunk_size
 
             if bin_ranges is not None:
-                batch_bins = bin_ranges[len(results): len(results) + len(batch_seeds)]
+                batch_bins = bin_ranges[bin_offset: bin_offset + len(batch_seeds)]
                 while len(batch_bins) < len(batch_seeds):
                     batch_bins.append((min_tok, max_tok))
+                bin_offset += len(batch_seeds)
             else:
                 batch_bins = None
 
