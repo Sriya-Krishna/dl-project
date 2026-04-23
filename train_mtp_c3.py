@@ -20,6 +20,7 @@ import argparse
 import glob
 import math
 import os
+import shutil
 import time
 
 import torch
@@ -229,12 +230,48 @@ def train_step(batch, model, mtp_head, prompt_ids, K, device):
 
 
 # ---------------------------------------------------------------------------
+# Validation loop
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def run_validation(val_dataloader, model, mtp_head, prompt_ids, K, device,
+                   max_batches=50):
+    """Run forward passes on held-out data and return average metrics."""
+    model.eval()
+    mtp_head.eval()
+
+    total_loss = 0.0
+    total_recon = 0.0
+    total_mtp = [0.0] * K
+    n_batches = 0
+
+    for batch_idx, batch in enumerate(val_dataloader):
+        if batch_idx >= max_batches:
+            break
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss, recon, mtp_losses = train_step(
+                batch, model, mtp_head, prompt_ids, K, device)
+        total_loss += loss.item()
+        total_recon += recon.item()
+        for k in range(K):
+            total_mtp[k] += mtp_losses[k].item()
+        n_batches += 1
+
+    model.train()
+    mtp_head.train()
+
+    n = max(n_batches, 1)
+    return total_loss / n, total_recon / n, [t / n for t in total_mtp]
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint utilities
 # ---------------------------------------------------------------------------
 
 def find_latest_checkpoint(save_dir):
     """Scan save_dir for step_XXXXX directories, return path with highest step.
 
+    Validates each candidate by loading training_state.pt — skips corrupted ones.
     Returns None if save_dir doesn't exist or contains no valid checkpoints.
     """
     if not os.path.exists(save_dir):
@@ -244,9 +281,14 @@ def find_latest_checkpoint(save_dir):
         if name.startswith("step_") and name[5:].isdigit():
             step_num = int(name[5:])
             ckpt_path = os.path.join(save_dir, name)
-            # Verify it's a usable checkpoint (has training_state.pt)
-            if os.path.exists(os.path.join(ckpt_path, "training_state.pt")):
+            state_path = os.path.join(ckpt_path, "training_state.pt")
+            if not os.path.exists(state_path):
+                continue
+            try:
+                torch.load(state_path, map_location="cpu", weights_only=True)
                 candidates.append((step_num, ckpt_path))
+            except Exception:
+                print(f"  Warning: corrupted checkpoint {ckpt_path}, skipping")
     if not candidates:
         return None
     candidates.sort(key=lambda x: x[0])
@@ -254,41 +296,65 @@ def find_latest_checkpoint(save_dir):
 
 
 def save_checkpoint(model, mtp_head, optimizer, scheduler,
-                    step, epoch, args, save_dir):
-    """Save LoRA adapter, MTP head, optimizer, and training state."""
-    os.makedirs(save_dir, exist_ok=True)
-    model.save_pretrained(os.path.join(save_dir, "lora_adapter"))
-    torch.save(mtp_head.state_dict(), os.path.join(save_dir, "mtp_head.pt"))
+                    step, epoch, batch_idx_in_epoch, args, save_dir):
+    """Save LoRA adapter, MTP head, optimizer, and training state.
+
+    Atomic: writes to a .tmp directory first, then renames. If the process
+    crashes mid-save, the .tmp dir is ignored by find_latest_checkpoint.
+    """
+    tmp_dir = save_dir + ".tmp"
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    model.save_pretrained(os.path.join(tmp_dir, "lora_adapter"))
+    torch.save(mtp_head.state_dict(), os.path.join(tmp_dir, "mtp_head.pt"))
     torch.save({
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler else None,
         "step": step,
         "epoch": epoch,
+        "batch_idx_in_epoch": batch_idx_in_epoch,
+        "batch_size": args.batch_size,
         "mtp_k": args.mtp_k,
         "lr": args.lr,
-    }, os.path.join(save_dir, "training_state.pt"))
+    }, os.path.join(tmp_dir, "training_state.pt"))
+
+    # Atomic swap — if save_dir exists (e.g. final ckpt matching periodic),
+    # remove it first so rename succeeds.
+    if os.path.exists(save_dir):
+        shutil.rmtree(save_dir)
+    os.rename(tmp_dir, save_dir)
     print(f"  Checkpoint saved to {save_dir}")
 
 
 def load_checkpoint(model, mtp_head, optimizer, scheduler, checkpoint_dir, device):
-    """Load a saved checkpoint. Returns (step, epoch)."""
-    lora_dir = os.path.join(checkpoint_dir, "lora_adapter")
-    if os.path.exists(lora_dir):
-        model.load_adapter(lora_dir, adapter_name="default")
+    """Load a saved checkpoint. Returns (step, epoch, batch_idx_in_epoch).
 
-    mtp_path = os.path.join(checkpoint_dir, "mtp_head.pt")
-    if os.path.exists(mtp_path):
-        mtp_head.load_state_dict(
-            torch.load(mtp_path, map_location=device, weights_only=True))
+    If loading fails (corrupted files), prints a warning and returns zeros
+    so training can restart from scratch instead of crashing.
+    """
+    try:
+        lora_dir = os.path.join(checkpoint_dir, "lora_adapter")
+        if os.path.exists(lora_dir):
+            model.load_adapter(lora_dir, adapter_name="default")
 
-    state_path = os.path.join(checkpoint_dir, "training_state.pt")
-    if os.path.exists(state_path):
+        mtp_path = os.path.join(checkpoint_dir, "mtp_head.pt")
+        if os.path.exists(mtp_path):
+            mtp_head.load_state_dict(
+                torch.load(mtp_path, map_location=device, weights_only=True))
+
+        state_path = os.path.join(checkpoint_dir, "training_state.pt")
         state = torch.load(state_path, map_location=device, weights_only=True)
         optimizer.load_state_dict(state["optimizer"])
         if scheduler and state.get("scheduler"):
             scheduler.load_state_dict(state["scheduler"])
-        return state["step"], state.get("epoch", 0)
-    return 0, 0
+        return (state["step"], state.get("epoch", 0),
+                state.get("batch_idx_in_epoch", 0))
+    except Exception as e:
+        print(f"  WARNING: failed to load checkpoint {checkpoint_dir}: {e}")
+        print(f"  Starting from scratch.")
+        return 0, 0, 0
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +394,12 @@ def main():
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--val_latent_dir", type=str, default=None,
+                        help="Latent dir for held-out set (skip validation if omitted)")
+    parser.add_argument("--val_every", type=int, default=2000,
+                        help="Run validation every N steps")
+    parser.add_argument("--val_batches", type=int, default=50,
+                        help="Max batches per validation run")
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -395,6 +467,24 @@ def main():
     )
     steps_per_epoch = len(sampler._batches)  # exact: pre-built batches count
 
+    # --- Validation dataloader (optional) ---
+    val_dataloader = None
+    if args.val_latent_dir:
+        val_dataset = LatentDataset(args.val_latent_dir)
+        val_sampler = LengthBucketSampler(
+            val_dataset, args.batch_size, shuffle=False, seed=0)
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            sampler=val_sampler,
+            collate_fn=collate_fn,
+            num_workers=2,
+            pin_memory=True,
+            drop_last=True,
+        )
+        print(f"Validation: {len(val_dataset)} examples, "
+              f"every {args.val_every} steps, {args.val_batches} batches/run")
+
     # --- Optimizer & scheduler ---
     trainable_params = (
         list(filter(lambda p: p.requires_grad, model.parameters()))
@@ -406,18 +496,14 @@ def main():
     # --- Auto-resume: find latest checkpoint ---
     start_step = 0
     start_epoch = 0
+    start_batch_idx = 0
     latest_ckpt = find_latest_checkpoint(args.save_dir)
     if latest_ckpt:
         print(f"Auto-resuming from {latest_ckpt}...")
-        start_step, start_epoch = load_checkpoint(
+        start_step, start_epoch, start_batch_idx = load_checkpoint(
             model, mtp_head, optimizer, scheduler, latest_ckpt, device)
-        print(f"Resumed at step={start_step}, epoch={start_epoch}")
-    else:
-        print("No checkpoint found — starting from scratch.")
-
-    # Compute how far into start_epoch we already were
-    steps_done_in_start_epoch = start_step - start_epoch * steps_per_epoch
-    steps_done_in_start_epoch = max(0, steps_done_in_start_epoch)
+        print(f"Resumed at step={start_step}, epoch={start_epoch}, "
+              f"batch_idx={start_batch_idx}")
 
     # --- Training loop ---
     print(f"\nStarting training: K={args.mtp_k}, lr={args.lr}, "
@@ -438,7 +524,7 @@ def main():
         for batch_idx, batch in enumerate(dataloader):
             # Fast-forward: skip batches already processed in this epoch.
             # Data is in RAM, so enumerate is cheap — no GPU work happens here.
-            if epoch == start_epoch and batch_idx < steps_done_in_start_epoch:
+            if epoch == start_epoch and batch_idx < start_batch_idx:
                 continue
 
             if step >= args.max_steps:
@@ -480,14 +566,27 @@ def main():
             if step % args.save_every == 0:
                 ckpt_dir = os.path.join(args.save_dir, f"step_{step}")
                 save_checkpoint(model, mtp_head, optimizer, scheduler,
-                                step, epoch, args, ckpt_dir)
+                                step, epoch, batch_idx + 1, args, ckpt_dir)
+
+            # --- Validation ---
+            if val_dataloader and step % args.val_every == 0:
+                t_val = time.time()
+                val_loss, val_recon, val_mtp = run_validation(
+                    val_dataloader, model, mtp_head, prompt_ids,
+                    args.mtp_k, device, max_batches=args.val_batches)
+                val_mtp_strs = ", ".join(
+                    f"mtp_{k+1}={val_mtp[k]:.4f}" for k in range(args.mtp_k))
+                print(f"  [VAL step={step}] loss={val_loss:.4f} | "
+                      f"recon={val_recon:.4f} | {val_mtp_strs} | "
+                      f"took {time.time()-t_val:.0f}s")
 
         epoch += 1
 
-    # Final checkpoint
+    # Final checkpoint (skip if this step was already saved by periodic checkpointing)
     ckpt_dir = os.path.join(args.save_dir, f"step_{step}")
-    save_checkpoint(model, mtp_head, optimizer, scheduler,
-                    step, epoch, args, ckpt_dir)
+    if not os.path.exists(ckpt_dir):
+        save_checkpoint(model, mtp_head, optimizer, scheduler,
+                        step, epoch, 0, args, ckpt_dir)
     print(f"\nTraining complete. Final step: {step}")
 
 
