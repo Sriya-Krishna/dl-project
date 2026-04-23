@@ -13,6 +13,7 @@ import argparse
 import csv
 import glob
 import os
+import time
 
 import torch
 import torch.nn as nn
@@ -149,75 +150,87 @@ def load_shard_data(latent_dir):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def generate_with_mtp(model, mtp_head, latent_embeds, prompt_embeds,
-                      max_new_tokens, K, eos_id, device):
+def generate_batch_with_mtp(model, mtp_head, latents_batch, prompt_embeds,
+                            max_new_tokens, K, eos_id, device):
     """
-    Custom autoregressive generation with KV cache.
-    Also records MTP draft predictions at each step for acceptance rate.
+    Batched autoregressive generation with KV cache and MTP draft tracking.
+
+    All examples share the same prefix length (32 latent + P prompt), so no
+    padding is needed. Finished sequences (EOS) continue decoding but their
+    extra tokens are trimmed when extracting results.
+
+    Args:
+        latents_batch: [B, 32, D] batched latent embeddings
+        prompt_embeds:  [1, P, D] prompt embeddings (broadcast to B)
 
     Returns:
-        generated: list of token IDs
-        mtp_drafts: list of K-length lists of draft token IDs per step
+        list of (generated_ids, mtp_drafts) per example in the batch
     """
-    base = model.base_model.model          # C3QwenForCausalLM
+    B = latents_batch.shape[0]
+    base = model.base_model.model
     lm_head = base.lm_head
     embed_fn = base.model.embed_tokens
-    backbone = base.model                   # C3QwenModel (LoRA active)
+    backbone = base.model
 
-    # Prefill: forward full prefix [latents | prompt]
-    prefix = torch.cat([latent_embeds, prompt_embeds], dim=1)  # [1, 32+P, 2048]
+    # Prefill: [latents | prompt] for all examples
+    prompt_exp = prompt_embeds.expand(B, -1, -1)
+    prefix = torch.cat([latents_batch, prompt_exp], dim=1)  # [B, 32+P, D]
     outputs = Qwen2Model.forward(
-        backbone,
-        input_ids=None,
-        inputs_embeds=prefix,
-        use_cache=True,
-        output_hidden_states=True,
-        return_dict=True,
-    )
+        backbone, input_ids=None, inputs_embeds=prefix,
+        use_cache=True, output_hidden_states=True, return_dict=True)
     past_kv = outputs.past_key_values
-    last_h = outputs.last_hidden_state[:, -1:, :]  # [1, 1, 2048]
-    next_logits = lm_head(last_h)[:, 0, :]         # [1, V]
+    last_h = outputs.last_hidden_state[:, -1:, :]  # [B, 1, D]
+    next_logits = lm_head(last_h).squeeze(1)        # [B, V]
 
-    generated = []
-    mtp_drafts = []
+    # Pre-allocate storage
+    all_tokens = torch.full((B, max_new_tokens), eos_id, dtype=torch.long,
+                            device=device)
+    all_drafts = torch.zeros(B, max_new_tokens, K, dtype=torch.long,
+                             device=device)
+    gen_lengths = torch.full((B,), max_new_tokens, dtype=torch.long,
+                             device=device)
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
 
     for step in range(max_new_tokens):
-        token_id = next_logits.argmax(dim=-1).item()
-        generated.append(token_id)
-        if token_id == eos_id:
+        token_ids = next_logits.argmax(dim=-1)  # [B]
+        all_tokens[:, step] = token_ids
+
+        # Mark newly finished sequences
+        just_finished = (token_ids == eos_id) & ~finished
+        gen_lengths[just_finished] = step + 1
+        finished = finished | just_finished
+
+        if finished.all():
             break
 
-        # Compute MTP drafts from current hidden state
-        drafts = []
-        h = last_h[:, 0, :]  # [1, 2048]
+        # MTP drafts (batched: lm_head and mtp_head process all B at once)
+        h = last_h.squeeze(1)  # [B, D]
         z = h
         for k in range(K):
-            if k == 0:
-                z = mtp_head(h)
-            else:
-                z = mtp_head(z + h)
-            draft_logits = lm_head(z)  # [1, V]
-            draft_id = draft_logits.argmax(dim=-1).item()
-            drafts.append(draft_id)
-        mtp_drafts.append(drafts)
+            z = mtp_head(h) if k == 0 else mtp_head(z + h)
+            all_drafts[:, step, k] = lm_head(z).argmax(dim=-1)
 
-        # Next step: feed token through decoder with KV cache
-        token_tensor = torch.tensor([[token_id]], device=device, dtype=torch.long)
-        tok_embed = embed_fn(token_tensor)  # [1, 1, 2048]
+        # Decode step
+        tok_embed = embed_fn(token_ids.unsqueeze(1))  # [B, 1, D]
         outputs = Qwen2Model.forward(
-            backbone,
-            input_ids=None,
-            inputs_embeds=tok_embed,
-            past_key_values=past_kv,
-            use_cache=True,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+            backbone, input_ids=None, inputs_embeds=tok_embed,
+            past_key_values=past_kv, use_cache=True,
+            output_hidden_states=True, return_dict=True)
         past_kv = outputs.past_key_values
-        last_h = outputs.last_hidden_state  # [1, 1, 2048]
-        next_logits = lm_head(last_h)[:, 0, :]
+        last_h = outputs.last_hidden_state  # [B, 1, D]
+        next_logits = lm_head(last_h).squeeze(1)
 
-    return generated, mtp_drafts
+    # Convert to per-example lists (matching format expected by metrics)
+    results = []
+    for i in range(B):
+        L = gen_lengths[i].item()
+        gen_ids = all_tokens[i, :L].tolist()
+        # Drafts: exclude EOS step (no drafts recorded there, matches original)
+        draft_len = L - 1 if gen_ids[-1] == eos_id else L
+        drafts = all_drafts[i, :draft_len].tolist()
+        results.append((gen_ids, drafts))
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +279,9 @@ def main():
     parser.add_argument("--mtp_k", type=int, default=5)
     parser.add_argument("--output", type=str, default="results.csv")
     parser.add_argument("--prompt", type=str, default="Repeat the text: ")
-    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--max_new_tokens", type=int, default=1400)
+    parser.add_argument("--eval_batch_size", type=int, default=32,
+                        help="Batch size for generation (higher = faster, more VRAM)")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max_examples", type=int, default=None,
                         help="Limit number of examples (for quick testing)")
@@ -292,48 +307,60 @@ def main():
 
     # Run
     K = args.mtp_k
+    BS = args.eval_batch_size
     results = []
+    n_total = len(held_out_data)
+    t0 = time.time()
 
-    print(f"\nRunning on {len(held_out_data)} examples with K={K}...")
-    for idx, example in enumerate(held_out_data):
-        latents = example["latents"].unsqueeze(0).to(device, dtype=torch.bfloat16)
-        target_ids = example["target_ids"].tolist()
-        ground_truth_text = tokenizer.decode(target_ids, skip_special_tokens=True)
-        input_length = len(target_ids)
+    print(f"\nRunning on {n_total} examples with K={K}, "
+          f"batch_size={BS}...")
+    for batch_start in range(0, n_total, BS):
+        batch_end = min(batch_start + BS, n_total)
+        batch_examples = held_out_data[batch_start:batch_end]
 
-        # Generate
-        generated_ids, mtp_drafts = generate_with_mtp(
-            model, mtp_head, latents, prompt_embeds,
+        # Stack latents into a batch
+        latents_batch = torch.stack(
+            [ex["latents"] for ex in batch_examples]
+        ).to(device, dtype=torch.bfloat16)  # [B, 32, 2048]
+
+        # Batched generation
+        batch_results = generate_batch_with_mtp(
+            model, mtp_head, latents_batch, prompt_embeds,
             max_new_tokens=args.max_new_tokens, K=K,
-            eos_id=eos_id, device=device,
-        )
+            eos_id=eos_id, device=device)
 
-        # Decode generated text
-        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        # Compute metrics per example
+        for j, (gen_ids, drafts) in enumerate(batch_results):
+            example = batch_examples[j]
+            target_ids = example["target_ids"].tolist()
+            ground_truth_text = tokenizer.decode(
+                target_ids, skip_special_tokens=True)
+            generated_text = tokenizer.decode(
+                gen_ids, skip_special_tokens=True)
 
-        # Metrics
-        exact_match = int(generated_text == ground_truth_text)
-        char_dist = char_edit_distance(generated_text, ground_truth_text)
-        tok_dist = token_edit_distance(generated_ids, target_ids)
-        accept_rates = compute_acceptance_rates(generated_ids, mtp_drafts, K)
+            exact_match = int(generated_text == ground_truth_text)
+            char_dist = char_edit_distance(generated_text, ground_truth_text)
+            tok_dist = token_edit_distance(gen_ids, target_ids)
+            accept_rates = compute_acceptance_rates(gen_ids, drafts, K)
 
-        row = {
-            "input_length": input_length,
-            "exact_match": exact_match,
-            "char_edit_dist": char_dist,
-            "token_edit_dist": tok_dist,
-        }
-        for k in range(K):
-            row[f"accept_rate_{k+1}"] = round(accept_rates[k], 4)
+            row = {
+                "input_length": len(target_ids),
+                "exact_match": exact_match,
+                "char_edit_dist": char_dist,
+                "token_edit_dist": tok_dist,
+            }
+            for k in range(K):
+                row[f"accept_rate_{k+1}"] = round(accept_rates[k], 4)
+            results.append(row)
 
-        results.append(row)
-
-        if (idx + 1) % 50 == 0 or idx == 0:
-            em_so_far = sum(r["exact_match"] for r in results) / len(results)
-            print(f"  [{idx+1}/{len(held_out_data)}] "
-                  f"EM={em_so_far:.3f} | "
-                  f"char_dist={char_dist} | tok_dist={tok_dist} | "
-                  f"accept_1={accept_rates[0]:.3f}")
+        # Progress
+        done = len(results)
+        elapsed = time.time() - t0
+        rate = done / elapsed if elapsed > 0 else 0
+        em_so_far = sum(r["exact_match"] for r in results) / done
+        eta = (n_total - done) / rate if rate > 0 else 0
+        print(f"  [{done}/{n_total}] EM={em_so_far:.3f} | "
+              f"{rate:.1f} ex/s | ETA {eta/60:.1f} min")
 
     # Write CSV
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
