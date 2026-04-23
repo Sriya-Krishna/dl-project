@@ -67,7 +67,7 @@ def load_model(model_name, device="cuda", compile_encoder=False):
     if compile_encoder:
         print("Compiling encoder with torch.compile (first batch will be slow)...")
         model.model.llm1 = torch.compile(
-            model.model.llm1, mode="reduce-overhead", fullgraph=False)
+            model.model.llm1, mode="default", fullgraph=False)
 
     print("Model ready.")
     return model, tokenizer
