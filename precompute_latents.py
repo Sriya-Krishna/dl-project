@@ -66,8 +66,8 @@ def load_model(model_name, device="cuda", compile_encoder=False):
 
     if compile_encoder:
         print("Compiling encoder with torch.compile (first batch will be slow)...")
-        model.model.llm1 = torch.compile(
-            model.model.llm1, mode="default", fullgraph=False)
+        model.model.llm1.model = torch.compile(
+            model.model.llm1.model, mode="default", fullgraph=False)
 
     print("Model ready.")
     return model, tokenizer
@@ -130,7 +130,7 @@ def encode_batch(model, ctx_ids_batch, device="cuda"):
     config     = model.config
     latent_len = config.latent_token_len  # 32
     im_start   = config.im_start_token   # 151857
-    encoder    = model.model.llm1
+    encoder    = model.model.llm1.model  # Qwen2Model base — no LM head, no logits
     Q_weight   = model.model.Q.weight    # [32, 1536]
     mm_proj    = model.model.mm_projector
 
@@ -163,16 +163,15 @@ def encode_batch(model, ctx_ids_batch, device="cuda"):
         query_pos,
     ] = Q_cast.unsqueeze(0).expand(B, -1, -1)
 
-    # Encoder forward
+    # Encoder forward — base Qwen2Model returns last_hidden_state directly,
+    # no LM head → no [B, S, vocab_size] logits allocation.
     with torch.inference_mode():
         out = encoder(
-            input_ids=None,
             inputs_embeds=context_embeds,
             attention_mask=attention_mask,
-            output_hidden_states=True,
             return_dict=True,
         )
-    last_hidden = out["hidden_states"][-1]  # [B, S, 1536]
+    last_hidden = out.last_hidden_state  # [B, S, 1536]
 
     # Extract query positions (vectorized)
     latents_raw = last_hidden[
