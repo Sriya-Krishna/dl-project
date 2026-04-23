@@ -152,7 +152,7 @@ def encode_batch(model, ctx_ids_batch, device="cuda"):
         [L - latent_len - 2 for L in lengths], dtype=torch.long, device=device)
 
     # Embed tokens, then scatter Q.weight into query positions (vectorized)
-    context_embeds = encoder.model.embed_tokens(input_ids)  # [B, S, 1536]
+    context_embeds = encoder.embed_tokens(input_ids)  # [B, S, 1536]
     Q_cast = Q_weight.to(device=device, dtype=context_embeds.dtype)  # [32, 1536]
     # Build a [B, 32] index tensor of positions to overwrite
     offsets = torch.arange(1, latent_len + 1, device=device)          # [32]
