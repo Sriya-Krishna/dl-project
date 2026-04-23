@@ -147,7 +147,7 @@ def collate_fn(batch):
 # Training step
 # ---------------------------------------------------------------------------
 
-def train_step(batch, model, mtp_head, prompt_ids, K, device):
+def train_step(batch, model, mtp_head, prompt_ids, K, device, mtp_weight=1.0):
     """Single training step. Returns total_loss, recon_loss, list of mtp_k losses."""
     latents = batch["latents"].to(device, dtype=torch.bfloat16)       # [B, 32, 2048]
     target_ids = batch["target_ids"].to(device)                       # [B, L]
@@ -225,7 +225,7 @@ def train_step(batch, model, mtp_head, prompt_ids, K, device):
         )
         mtp_losses.append(mtp_k_loss)
 
-    total_loss = recon_loss + sum(mtp_losses) / max(K, 1)
+    total_loss = recon_loss + mtp_weight * sum(mtp_losses) / max(K, 1)
     return total_loss, recon_loss, mtp_losses
 
 
@@ -397,8 +397,10 @@ def main():
     parser.add_argument("--latent_dir", type=str, required=True)
     parser.add_argument("--model_name", type=str,
                         default="liufanfanlff/C3-Context-Cascade-Compression")
-    parser.add_argument("--mtp_k", type=int, default=5, choices=[1, 5, 10])
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--mtp_k", type=int, default=3, choices=[1, 2, 3, 5, 10])
+    parser.add_argument("--mtp_weight", type=float, default=0.3,
+                        help="Weight for MTP loss relative to recon loss")
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--min_lr_ratio", type=float, default=0.1,
                         help="Final LR as fraction of peak (0.1 = decay to 10%%)")
     parser.add_argument("--stable_frac", type=float, default=0.8,
@@ -572,7 +574,8 @@ def main():
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 total_loss, recon_loss, mtp_losses = train_step(
-                    batch, model, mtp_head, prompt_ids, args.mtp_k, device)
+                    batch, model, mtp_head, prompt_ids, args.mtp_k, device,
+                    mtp_weight=args.mtp_weight)
 
             (total_loss / grad_accum).backward()
             accum_loss += total_loss.item()

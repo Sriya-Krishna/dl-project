@@ -4,5 +4,6 @@ peft>=0.13.0
 accelerate
 flash-attn>=2.5.0
 safetensors
+datasets
 tiktoken
 python-Levenshtein
