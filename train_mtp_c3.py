@@ -394,6 +394,8 @@ def main():
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--grad_accum_steps", type=int, default=1,
+                        help="Gradient accumulation steps (effective batch = batch_size * this)")
     parser.add_argument("--val_latent_dir", type=str, default=None,
                         help="Latent dir for held-out set (skip validation if omitted)")
     parser.add_argument("--val_every", type=int, default=2000,
@@ -506,20 +508,28 @@ def main():
               f"batch_idx={start_batch_idx}")
 
     # --- Training loop ---
+    grad_accum = args.grad_accum_steps
+    eff_batch = args.batch_size * grad_accum
     print(f"\nStarting training: K={args.mtp_k}, lr={args.lr}, "
-          f"batch_size={args.batch_size}, max_steps={args.max_steps}")
-    print(f"steps_per_epoch={steps_per_epoch}")
+          f"micro_batch={args.batch_size}, grad_accum={grad_accum}, "
+          f"eff_batch={eff_batch}, max_steps={args.max_steps}")
+    print(f"steps_per_epoch={steps_per_epoch // grad_accum}")
     print(f"{'='*80}")
 
     model.train()
     mtp_head.train()
     step = start_step
     running_loss = 0.0
+    accum_loss = 0.0
+    micro_count = 0
     t_start = time.time()
 
     epoch = start_epoch
     while step < args.max_steps:
         sampler.set_epoch(epoch)
+        optimizer.zero_grad()
+        micro_count = 0
+        accum_loss = 0.0
 
         for batch_idx, batch in enumerate(dataloader):
             # Fast-forward: skip batches already processed in this epoch.
@@ -530,20 +540,28 @@ def main():
             if step >= args.max_steps:
                 break
 
-            optimizer.zero_grad()
-
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 total_loss, recon_loss, mtp_losses = train_step(
                     batch, model, mtp_head, prompt_ids, args.mtp_k, device)
 
-            total_loss.backward()
+            (total_loss / grad_accum).backward()
+            accum_loss += total_loss.item()
+            micro_count += 1
+
+            if micro_count < grad_accum:
+                continue
+
+            # --- Full optimizer step ---
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 trainable_params, args.max_grad_norm)
             optimizer.step()
             scheduler.step()
+            optimizer.zero_grad()
 
             step += 1
-            running_loss += total_loss.item()
+            running_loss += accum_loss / grad_accum
+            accum_loss = 0.0
+            micro_count = 0
 
             # --- Logging ---
             if step % args.log_every == 0:
