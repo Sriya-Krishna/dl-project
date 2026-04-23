@@ -343,7 +343,14 @@ def main():
 
             exact_match = int(generated_text == ground_truth_text)
             char_dist = char_edit_distance(generated_text, ground_truth_text)
-            tok_dist = token_edit_distance(gen_ids, target_ids)
+            # Re-encode decoded text to strip special/padding tokens
+            # before computing token edit distance (model doesn't learn
+            # EOS so raw gen_ids contains trailing special tokens).
+            gen_clean = tokenizer.encode(
+                generated_text, add_special_tokens=False)
+            target_clean = tokenizer.encode(
+                ground_truth_text, add_special_tokens=False)
+            tok_dist = token_edit_distance(gen_clean, target_clean)
             accept_rates = compute_acceptance_rates(gen_ids, drafts, K)
 
             row = {

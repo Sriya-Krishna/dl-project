@@ -4,12 +4,14 @@ gen_data.py -- Generate synthetic arithmetic and logic chain data for MTP traini
 Produces JSONL files with controllable token length (100-1300 tokens via Qwen tokenizer).
 500K training examples + 5K eval examples at evenly distributed lengths.
 
-Speedups vs naive version:
-  - Estimate-then-trim: generate full chain in one shot, tokenize ONCE to verify,
-    trim trailing steps if over budget. Eliminates per-step tokenizer calls.
-  - Multiprocessing with fork: tokenizer loaded ONCE in main process, inherited by
-    all workers via copy-on-write memory — no per-worker download or disk read.
-  - Batch JSONL write at the end.
+Speedups:
+  - Char-based generation: text is built targeting a character budget (no tokenizer
+    in the hot loop). One batch-tokenize call per worker chunk verifies lengths.
+  - Batch tokenization: entire chunk tokenized in a single Rust call (~5-10x faster
+    than sequential Python encode calls).
+  - Calibrated chars/token ratio: measured from sample texts at startup.
+  - imap_unordered: results stream back as workers finish (instant progress).
+  - Multiprocessing with fork: tokenizer loaded ONCE in main, inherited by workers.
 
 Usage:
     python gen_data.py                        # defaults: 500K train, 5K eval
@@ -22,48 +24,32 @@ import multiprocessing as mp
 import os
 import random
 import time
+from bisect import bisect_right
 
 # Prevent OpenBLAS / OpenMP from spawning dozens of threads per worker.
-# Each gen_data worker is CPU-bound on pure Python — one thread suffices.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
-# Disable HuggingFace tokenizer parallelism inside each worker.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 # ---------------------------------------------------------------------------
-# Tokenizer global — loaded ONCE in main process, inherited by all workers via fork
+# Tokenizer global — loaded ONCE in main process, inherited by workers via fork
 # ---------------------------------------------------------------------------
 
 _tokenizer = None
 
 
 def _load_tokenizer(tokenizer_name):
-    """Load tokenizer into the global in the MAIN process before forking.
-
-    With fork start method, child processes inherit this directly from
-    the parent's memory (copy-on-write). No per-worker download or disk read.
-    """
     global _tokenizer
     from transformers import AutoTokenizer
     _tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_name, trust_remote_code=True)
 
 
-def _tok_len(text):
-    return len(_tokenizer.encode(text, add_special_tokens=False))
-
-
 # ---------------------------------------------------------------------------
-# Arithmetic chain — estimate then trim
+# Arithmetic chain generation
 # ---------------------------------------------------------------------------
-
-# Empirical: ", 1234 + 567 = 1801" encodes to ~8 tokens on Qwen.
-# Numbers with more digits encode to slightly more. We use 9 as a
-# conservative over-estimate so we never fall short.
-_ARITH_TOKENS_PER_STEP = 9
-
 
 def _arith_step(rng, val):
     """Generate one arithmetic step. Returns (op_str, new_val)."""
@@ -82,53 +68,41 @@ def _arith_step(rng, val):
         return f", {val} * {operand} = {val * operand}", val * operand
 
 
-def gen_arithmetic(rng, target_min, target_max):
-    """
-    Generate arithmetic chain targeting [target_min, target_max] tokens.
-    Tokenizes exactly ONCE (at the end). Trims from the tail if over budget.
-    """
-    target = rng.randint(target_min, target_max)
-    n_steps = max(1, target // _ARITH_TOKENS_PER_STEP)
-
+def _gen_arith_by_chars(rng, target_chars):
+    """Generate arithmetic chain targeting a character count. No tokenizer calls."""
     val = rng.randint(1, 9999)
-    steps = [str(val)]
-    for _ in range(n_steps + 10):  # small buffer in case estimate is short
+    parts = [str(val)]
+    total = len(parts[0])
+    while total < target_chars:
         step_str, val = _arith_step(rng, val)
-        steps.append(step_str)
+        parts.append(step_str)
+        total += len(step_str)
+    return "".join(parts), parts
 
-    # Build text and trim from the tail until we're within budget
-    text = "".join(steps)
-    tok = _tok_len(text)
 
-    while tok > target_max and len(steps) > 1:
-        steps.pop()
-        text = "".join(steps)
-        tok = _tok_len(text)
-
-    # If still too short, add more steps one at a time
-    while tok < target_min:
-        step_str, val = _arith_step(rng, val)
-        steps.append(step_str)
-        text = "".join(steps)
-        tok = _tok_len(text)
-        if tok > target_max:
-            steps.pop()
-            text = "".join(steps)
-            tok = _tok_len(text)
-            break
-
-    if target_min <= tok <= target_max:
-        return text, tok
-    return None, 0
+def _trim_arith_to_chars(parts, target_chars):
+    """Find largest prefix of arithmetic parts fitting within target_chars."""
+    cum = []
+    total = 0
+    for p in parts:
+        total += len(p)
+        cum.append(total)
+    n = bisect_right(cum, target_chars)
+    return "".join(parts[:max(n, 1)])
 
 
 # ---------------------------------------------------------------------------
-# Logic chain -- estimate then trim
+# Logic chain generation
 # ---------------------------------------------------------------------------
-
-_LOGIC_TOKENS_PER_PROP = 7   # "If A then B. " ~ 6 tokens; derivation ~ 5
 
 PROP_NAMES = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def _make_prop(idx):
+    if idx < 26:
+        return PROP_NAMES[idx]
+    group, pos = divmod(idx, 26)
+    return f"P{group}{PROP_NAMES[pos]}"
 
 
 def _build_logic_text(props, rng):
@@ -144,164 +118,215 @@ def _build_logic_text(props, rng):
     return " ".join(rules) + f" {props[0]} is true. " + " ".join(derivations)
 
 
-def gen_logic(rng, target_min, target_max):
+def _gen_logic_by_chars(rng, target_chars):
+    """Generate logic chain targeting a character count. No tokenizer calls.
+
+    Returns (text, props, rng_state_before_build) so the trim path can
+    rebuild with fewer props using the same random conjunction pattern.
     """
-    Generate a logic chain (or chain-of-chains for long targets).
-    Tokenizes exactly ONCE. Trims or extends prop list as needed.
-    """
-    target = rng.randint(target_min, target_max)
-
-    # For long targets, chain multiple independent prop groups
-    n_total_props = max(4, target // _LOGIC_TOKENS_PER_PROP)
-
-    # Build propositions: short names for first 26, then P{i}_{j} style
-    def make_prop(idx):
-        if idx < 26:
-            return PROP_NAMES[idx]
-        group, pos = divmod(idx, 26)
-        return f"P{group}{PROP_NAMES[pos]}"
-
-    props = [make_prop(i) for i in range(n_total_props)]
+    chars_per_prop = 28  # approximate average
+    n_props = max(4, target_chars // chars_per_prop)
+    props = [_make_prop(i) for i in range(n_props)]
     rng.shuffle(props)
-
+    rng_state = rng.getstate()
     text = _build_logic_text(props, rng)
-    tok = _tok_len(text)
-
-    # Trim: remove props from the tail until within budget
-    while tok > target_max and len(props) > 3:
-        props = props[:-1]
-        text = _build_logic_text(props, rng)
-        tok = _tok_len(text)
-
-    # Extend: add props one at a time if too short
+    # Extend if too short
     next_idx = len(props)
-    while tok < target_min:
-        props.append(make_prop(next_idx))
+    while len(text) < target_chars and next_idx < 500:
+        props.append(_make_prop(next_idx))
         next_idx += 1
+        rng_state = rng.getstate()
         text = _build_logic_text(props, rng)
-        tok = _tok_len(text)
-        if tok > target_max:
-            props = props[:-1]
-            text = _build_logic_text(props, rng)
-            tok = _tok_len(text)
-            break
+    return text, props, rng_state
 
-    if target_min <= tok <= target_max:
-        return text, tok
-    return None, 0
+
+def _trim_logic_to_chars(props, rng_state, target_chars):
+    """Binary search for largest prop count whose text fits target_chars.
+
+    Resetting rng_state before each _build_logic_text call ensures the
+    random conjunctions for the first M-1 props are identical to the
+    original text (same rng starting state, same loop iterations).
+    """
+    lo, hi = 3, len(props)
+    best_text = None
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        rng = random.Random()
+        rng.setstate(rng_state)
+        text = _build_logic_text(props[:mid], rng)
+        if len(text) <= target_chars:
+            lo = mid
+            best_text = text
+        else:
+            hi = mid - 1
+    if best_text is None:
+        rng = random.Random()
+        rng.setstate(rng_state)
+        best_text = _build_logic_text(props[:lo], rng)
+    return best_text
 
 
 # ---------------------------------------------------------------------------
-# Worker function (called by multiprocessing pool)
+# Worker function — char-based generation + batch tokenize
 # ---------------------------------------------------------------------------
 
 def _generate_batch(args):
     """
-    Generate a batch of examples. Called in a worker process.
+    Generate a batch of examples using char estimates, then batch-tokenize.
 
-    args: (seeds, min_tok, max_tok, bin_ranges)
-      seeds      : list of int seeds, one per example
-      min_tok    : global min (used when bin_ranges is None)
-      max_tok    : global max
-      bin_ranges : list of (lo, hi) per example, or None for uniform sampling
+    args: (seeds, min_tok, max_tok, bin_ranges, cpt)
+      cpt = chars-per-token ratio (calibrated at startup)
     """
-    seeds, min_tok, max_tok, bin_ranges = args
-    results = []
+    seeds, min_tok, max_tok, bin_ranges, cpt = args
+    n = len(seeds)
+
+    # Phase 1: Generate texts using char estimates (no tokenizer calls)
+    texts = [None] * n
+    dtypes = [None] * n
+    bounds = [None] * n
+    arith_parts = [None] * n
+    logic_trim_data = [None] * n  # (props, rng_state)
 
     for i, seed in enumerate(seeds):
         rng = random.Random(seed)
         lo = bin_ranges[i][0] if bin_ranges else min_tok
         hi = bin_ranges[i][1] if bin_ranges else max_tok
+        bounds[i] = (lo, hi)
+        target_tok = rng.randint(lo, hi)
+        target_chars = int(target_tok * cpt)
 
         dtype = rng.choice(["arithmetic", "logic"])
         if dtype == "arithmetic":
-            text, tok = gen_arithmetic(rng, lo, hi)
+            text, parts = _gen_arith_by_chars(rng, target_chars)
+            arith_parts[i] = parts
         else:
-            text, tok = gen_logic(rng, lo, hi)
+            text, props, rng_state = _gen_logic_by_chars(rng, target_chars)
+            logic_trim_data[i] = (props, rng_state)
 
-        # Fallback to the other type if first failed
-        if text is None:
-            if dtype == "arithmetic":
-                text, tok = gen_logic(rng, lo, hi)
-                dtype = "logic"
+        texts[i] = text
+        dtypes[i] = dtype
+
+    # Phase 2: Batch tokenize (one Rust call for the entire chunk)
+    encoded = _tokenizer(texts, add_special_tokens=False)
+
+    # Phase 3: Check bounds, trim overshoots
+    results = [None] * n
+    to_retrim = []
+
+    for i in range(n):
+        lo, hi = bounds[i]
+        tok = len(encoded["input_ids"][i])
+
+        if lo <= tok <= hi:
+            results[i] = {"text": texts[i], "type": dtypes[i],
+                          "token_count": tok}
+        elif tok > hi:
+            # Overshoot: trim using char estimate targeting range midpoint
+            target_chars = int(((lo + hi) // 2) * cpt)
+            if dtypes[i] == "arithmetic" and arith_parts[i]:
+                texts[i] = _trim_arith_to_chars(arith_parts[i], target_chars)
+            elif dtypes[i] == "logic" and logic_trim_data[i]:
+                props, rng_state = logic_trim_data[i]
+                texts[i] = _trim_logic_to_chars(props, rng_state, target_chars)
             else:
-                text, tok = gen_arithmetic(rng, lo, hi)
-                dtype = "arithmetic"
+                continue
+            to_retrim.append(i)
+        # else: undershoot — leave as None (will be retried)
 
-        if text is not None and lo <= tok <= hi:
-            results.append({"text": text, "type": dtype, "token_count": tok})
-        else:
-            results.append(None)
+    # Phase 4: Re-verify trimmed texts (second batch tokenize)
+    if to_retrim:
+        retrim_texts = [texts[i] for i in to_retrim]
+        re_enc = _tokenizer(retrim_texts, add_special_tokens=False)
+        for j, idx in enumerate(to_retrim):
+            lo, hi = bounds[idx]
+            tok = len(re_enc["input_ids"][j])
+            if lo <= tok <= hi:
+                results[idx] = {"text": texts[idx], "type": dtypes[idx],
+                                "token_count": tok}
 
     return results
 
 
 # ---------------------------------------------------------------------------
-# Parallel generation
+# Calibration
+# ---------------------------------------------------------------------------
+
+def _calibrate_cpt():
+    """Compute chars-per-token ratio from sample texts using actual tokenizer."""
+    rng = random.Random(12345)
+    samples = []
+
+    for _ in range(50):
+        val = rng.randint(1, 9999)
+        chain = str(val)
+        for _ in range(rng.randint(10, 100)):
+            step, val = _arith_step(rng, val)
+            chain += step
+        samples.append(chain)
+
+    for _ in range(50):
+        n = rng.randint(5, 50)
+        props = [_make_prop(i) for i in range(n)]
+        rng.shuffle(props)
+        text = _build_logic_text(props, rng)
+        samples.append(text)
+
+    encoded = _tokenizer(samples, add_special_tokens=False)
+    total_chars = sum(len(s) for s in samples)
+    total_tokens = sum(len(ids) for ids in encoded["input_ids"])
+    cpt = total_chars / total_tokens
+    print(f"  Calibrated chars/token = {cpt:.3f}")
+    return cpt
+
+
+# ---------------------------------------------------------------------------
+# Parallel generation with streaming progress
 # ---------------------------------------------------------------------------
 
 def generate_parallel(num_examples, min_tok, max_tok, base_seed,
-                      num_workers, bin_ranges=None, chunk_size=500):
-    """
-    Generate num_examples examples using a multiprocessing pool.
-
-    Tokenizer must already be loaded in the main process (_load_tokenizer called
-    before this). Workers inherit it via fork — no re-loading in workers.
-
-    bin_ranges: list of (lo, hi) per example for eval binning, or None.
-    """
+                      num_workers, cpt, bin_ranges=None, chunk_size=500):
+    """Generate num_examples using multiprocessing with streaming progress."""
     master_rng = random.Random(base_seed)
-    seeds = [master_rng.randint(0, 2**31) for _ in range(num_examples * 2)]
 
-    # No initializer needed: tokenizer is already in global _tokenizer,
-    # inherited by all workers via fork (copy-on-write).
-    pool = mp.Pool(processes=num_workers)
-
-    results = []
-    seed_idx = 0
-    t0 = time.time()
-    attempts = 0
-
-    while len(results) < num_examples:
-        needed = num_examples - len(results)
-        chunks = []
-        bin_offset = len(results)  # track how far into bin_ranges we've assigned
-        for _ in range(0, min(needed * 2, num_examples * 2 - seed_idx), chunk_size):
-            if seed_idx >= len(seeds):
-                seeds.extend(master_rng.randint(0, 2**31)
-                             for _ in range(chunk_size))
-            batch_seeds = seeds[seed_idx: seed_idx + chunk_size]
-            seed_idx += chunk_size
-
+    def chunks():
+        bin_offset = 0
+        yielded = 0
+        limit = num_examples * 3  # safety cap
+        while yielded < limit:
+            batch_seeds = [master_rng.randint(0, 2**31)
+                           for _ in range(chunk_size)]
             if bin_ranges is not None:
-                batch_bins = bin_ranges[bin_offset: bin_offset + len(batch_seeds)]
-                while len(batch_bins) < len(batch_seeds):
+                batch_bins = bin_ranges[bin_offset:bin_offset + chunk_size]
+                while len(batch_bins) < chunk_size:
                     batch_bins.append((min_tok, max_tok))
-                bin_offset += len(batch_seeds)
+                bin_offset += chunk_size
             else:
                 batch_bins = None
+            yield (batch_seeds, min_tok, max_tok, batch_bins, cpt)
+            yielded += chunk_size
 
-            chunks.append((batch_seeds, min_tok, max_tok, batch_bins))
-            attempts += len(batch_seeds)
+    pool = mp.Pool(processes=num_workers)
+    results = []
+    t0 = time.time()
+    last_print = 0
 
-            if len(results) + len(chunks) * chunk_size >= num_examples:
-                break
+    for batch_results in pool.imap_unordered(_generate_batch, chunks()):
+        for ex in batch_results:
+            if ex is not None and len(results) < num_examples:
+                results.append(ex)
 
-        for batch_results in pool.map(_generate_batch, chunks):
-            for ex in batch_results:
-                if ex is not None and len(results) < num_examples:
-                    results.append(ex)
+        done = len(results)
+        if done - last_print >= 10000 or done >= num_examples:
+            elapsed = time.time() - t0
+            rate = done / elapsed if elapsed > 0 else 0
+            eta = (num_examples - done) / rate if rate > 0 else 0
+            print(f"  {done}/{num_examples}  ({rate:.0f} ex/s, ETA {eta:.0f}s)")
+            last_print = done
 
-        elapsed = time.time() - t0
-        rate = len(results) / elapsed if elapsed > 0 else 0
-        print(f"  {len(results)}/{num_examples}  ({rate:.0f} ex/s, "
-              f"{attempts} attempts)")
-
-        if attempts > num_examples * 10:
-            print("  Warning: high attempt count — check token range settings.")
+        if done >= num_examples:
             break
 
-    pool.close()
+    pool.terminate()
     pool.join()
     return results[:num_examples]
 
@@ -352,11 +377,12 @@ def main():
     print(f"Workers: {args.num_workers}  |  chunk_size: {args.chunk_size}")
     print(f"Tokenizer: {args.tokenizer}")
 
-    # Load tokenizer ONCE here in the main process.
-    # With fork, all workers inherit this directly — no per-worker loading.
     print("Loading tokenizer (once, shared with all workers via fork)...")
     _load_tokenizer(args.tokenizer)
     print("Tokenizer ready.")
+
+    print("Calibrating chars/token ratio...")
+    cpt = _calibrate_cpt()
 
     # --- Training set ---
     print(f"\nGenerating {args.num_train} training examples "
@@ -368,6 +394,7 @@ def main():
         max_tok=args.max_tokens,
         base_seed=args.seed,
         num_workers=args.num_workers,
+        cpt=cpt,
         bin_ranges=None,
         chunk_size=args.chunk_size,
     )
@@ -391,6 +418,7 @@ def main():
         max_tok=args.max_tokens,
         base_seed=args.seed + 1,
         num_workers=args.num_workers,
+        cpt=cpt,
         bin_ranges=eval_bin_ranges,
         chunk_size=args.chunk_size,
     )
@@ -415,7 +443,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # fork on Linux: workers inherit the already-loaded tokenizer from the main
-    # process via copy-on-write — no re-download, no per-worker disk read.
     mp.set_start_method("fork", force=True)
     main()
