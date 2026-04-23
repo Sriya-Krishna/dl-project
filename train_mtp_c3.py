@@ -358,15 +358,33 @@ def load_checkpoint(model, mtp_head, optimizer, scheduler, checkpoint_dir, devic
 
 
 # ---------------------------------------------------------------------------
-# Cosine schedule with warmup
+# LR schedule: Warmup-Stable-Decay (WSD)
 # ---------------------------------------------------------------------------
 
-def get_cosine_schedule(optimizer, warmup_steps, total_steps):
+def get_wsd_schedule(optimizer, warmup_steps, total_steps,
+                     stable_frac=0.8, min_lr_ratio=0.1):
+    """Warmup-Stable-Decay schedule (Llama 3 / DeepSeek style).
+
+    Phase 1 — Linear warmup:  0 → peak_lr over warmup_steps
+    Phase 2 — Stable plateau: hold peak_lr for stable_frac of remaining steps
+    Phase 3 — Cosine decay:   peak_lr → min_lr over the rest
+
+    min_lr_ratio: final LR as fraction of peak (0.1 = decay to 10% of peak).
+    """
+    remaining = total_steps - warmup_steps
+    stable_steps = int(remaining * stable_frac)
+    decay_start = warmup_steps + stable_steps
+
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        if step < decay_start:
+            return 1.0
+        decay_steps = total_steps - decay_start
+        progress = min(1.0, (step - decay_start) / max(1, decay_steps))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (
+            1.0 + math.cos(math.pi * progress))
+
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
@@ -380,7 +398,11 @@ def main():
     parser.add_argument("--model_name", type=str,
                         default="liufanfanlff/C3-Context-Cascade-Compression")
     parser.add_argument("--mtp_k", type=int, default=5, choices=[1, 5, 10])
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.1,
+                        help="Final LR as fraction of peak (0.1 = decay to 10%%)")
+    parser.add_argument("--stable_frac", type=float, default=0.8,
+                        help="Fraction of post-warmup steps at peak LR before decay")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_steps", type=int, default=50_000)
     parser.add_argument("--warmup_steps", type=int, default=1000)
@@ -492,8 +514,16 @@ def main():
         list(filter(lambda p: p.requires_grad, model.parameters()))
         + list(mtp_head.parameters())
     )
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
-    scheduler = get_cosine_schedule(optimizer, args.warmup_steps, args.max_steps)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01,
+                                   betas=(0.9, 0.95))
+    scheduler = get_wsd_schedule(optimizer, args.warmup_steps, args.max_steps,
+                                 stable_frac=args.stable_frac,
+                                 min_lr_ratio=args.min_lr_ratio)
+    decay_start = args.warmup_steps + int(
+        (args.max_steps - args.warmup_steps) * args.stable_frac)
+    print(f"LR schedule (WSD): warmup 0→{args.lr:.0e} [{args.warmup_steps} steps] | "
+          f"stable [{args.warmup_steps}→{decay_start}] | "
+          f"decay → {args.lr * args.min_lr_ratio:.0e} [{decay_start}→{args.max_steps}]")
 
     # --- Auto-resume: find latest checkpoint ---
     start_step = 0
