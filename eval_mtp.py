@@ -293,6 +293,9 @@ def main():
     model, mtp_head, tokenizer = load_model_for_evaluation(
         args.model_name, args.checkpoint_dir, device=args.device)
     eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        eos_id = tokenizer.convert_tokens_to_ids("<|endoftext|>")
+        print(f"eos_token_id was None, using <|endoftext|> = {eos_id}")
 
     # Tokenize prompt
     prompt_ids = torch.tensor(
