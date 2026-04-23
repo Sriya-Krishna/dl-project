@@ -79,8 +79,8 @@ def load_texts(dataset_name, dataset_config, text_field, splits):
 def main():
     parser = argparse.ArgumentParser(
         description="Prepare real text data for MTP training")
-    parser.add_argument("--output_train", type=str, default="data/train.jsonl")
-    parser.add_argument("--output_eval",  type=str, default="data/eval.jsonl")
+    parser.add_argument("--output_train", type=str, default="data_real/train.jsonl")
+    parser.add_argument("--output_eval",  type=str, default="data_real/eval.jsonl")
     parser.add_argument("--num_train",    type=int, default=100_000)
     parser.add_argument("--num_eval",     type=int, default=2_000)
     parser.add_argument("--min_tokens",   type=int, default=100)

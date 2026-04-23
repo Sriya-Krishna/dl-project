@@ -264,7 +264,7 @@ def main():
     parser.add_argument("--checkpoint_dir", type=str, required=True,
                         help="Checkpoint directory (contains lora_adapter/ and mtp_head.pt)")
     parser.add_argument("--mtp_k", type=int, default=5)
-    parser.add_argument("--output", type=str, default="results.csv")
+    parser.add_argument("--output", type=str, default="results_real.csv")
     parser.add_argument("--prompt", type=str, default="Repeat the text: ")
     parser.add_argument("--max_new_tokens", type=int, default=2048)
     parser.add_argument("--device", type=str, default="cuda")

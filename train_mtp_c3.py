@@ -408,7 +408,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_steps", type=int, default=50_000)
     parser.add_argument("--warmup_steps", type=int, default=1000)
-    parser.add_argument("--save_dir", type=str, default="checkpoints")
+    parser.add_argument("--save_dir", type=str, default="checkpoints_real")
     parser.add_argument("--save_every", type=int, default=2000)
     parser.add_argument("--log_every", type=int, default=50)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
