@@ -269,6 +269,7 @@ def main():
               f"skipping first {skip} examples.")
     ctx_ids_list    = ctx_ids_list[skip:]
     target_ids_list = target_ids_list[skip:]
+    n_local = len(ctx_ids_list)
 
     # --- Run encoder ---
     print(f"\n[rank {args.rank}] Running encoder "
