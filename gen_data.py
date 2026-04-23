@@ -174,10 +174,9 @@ def _generate_batch(args):
     """
     Generate a batch of examples using char estimates, then batch-tokenize.
 
-    args: (seeds, min_tok, max_tok, bin_ranges, cpt)
-      cpt = chars-per-token ratio (calibrated at startup)
+    args: (seeds, min_tok, max_tok, bin_ranges, cpt_arith, cpt_logic)
     """
-    seeds, min_tok, max_tok, bin_ranges, cpt = args
+    seeds, min_tok, max_tok, bin_ranges, cpt_arith, cpt_logic = args
     n = len(seeds)
 
     # Phase 1: Generate texts using char estimates (no tokenizer calls)
@@ -193,9 +192,11 @@ def _generate_batch(args):
         hi = bin_ranges[i][1] if bin_ranges else max_tok
         bounds[i] = (lo, hi)
         target_tok = rng.randint(lo, hi)
-        target_chars = int(target_tok * cpt)
 
         dtype = rng.choice(["arithmetic", "logic"])
+        cpt = cpt_arith if dtype == "arithmetic" else cpt_logic
+        target_chars = int(target_tok * cpt)
+
         if dtype == "arithmetic":
             text, parts = _gen_arith_by_chars(rng, target_chars)
             arith_parts[i] = parts
@@ -221,7 +222,8 @@ def _generate_batch(args):
             results[i] = {"text": texts[i], "type": dtypes[i],
                           "token_count": tok}
         elif tok > hi:
-            # Overshoot: trim using char estimate targeting range midpoint
+            # Overshoot: trim using per-type char estimate
+            cpt = cpt_arith if dtypes[i] == "arithmetic" else cpt_logic
             target_chars = int(((lo + hi) // 2) * cpt)
             if dtypes[i] == "arithmetic" and arith_parts[i]:
                 texts[i] = _trim_arith_to_chars(arith_parts[i], target_chars)
@@ -252,9 +254,15 @@ def _generate_batch(args):
 # ---------------------------------------------------------------------------
 
 def _calibrate_cpt():
-    """Compute chars-per-token ratio from sample texts using actual tokenizer."""
+    """Compute per-type chars-per-token ratios from sample texts.
+
+    Returns (cpt_arith, cpt_logic) — separate ratios because arithmetic
+    (number-heavy, ~1.1 c/t) and logic (English words, ~3+ c/t) diverge
+    heavily. A blended average causes massive under/overshoot.
+    """
     rng = random.Random(12345)
-    samples = []
+    arith_samples = []
+    logic_samples = []
 
     for _ in range(50):
         val = rng.randint(1, 9999)
@@ -262,21 +270,29 @@ def _calibrate_cpt():
         for _ in range(rng.randint(10, 100)):
             step, val = _arith_step(rng, val)
             chain += step
-        samples.append(chain)
+        arith_samples.append(chain)
 
     for _ in range(50):
         n = rng.randint(5, 50)
         props = [_make_prop(i) for i in range(n)]
         rng.shuffle(props)
         text = _build_logic_text(props, rng)
-        samples.append(text)
+        logic_samples.append(text)
 
-    encoded = _tokenizer(samples, add_special_tokens=False)
-    total_chars = sum(len(s) for s in samples)
-    total_tokens = sum(len(ids) for ids in encoded["input_ids"])
-    cpt = total_chars / total_tokens
-    print(f"  Calibrated chars/token = {cpt:.3f}")
-    return cpt
+    arith_enc = _tokenizer(arith_samples, add_special_tokens=False)
+    logic_enc = _tokenizer(logic_samples, add_special_tokens=False)
+
+    arith_chars = sum(len(s) for s in arith_samples)
+    arith_tokens = sum(len(ids) for ids in arith_enc["input_ids"])
+    cpt_arith = arith_chars / arith_tokens
+
+    logic_chars = sum(len(s) for s in logic_samples)
+    logic_tokens = sum(len(ids) for ids in logic_enc["input_ids"])
+    cpt_logic = logic_chars / logic_tokens
+
+    print(f"  Calibrated chars/token: arithmetic={cpt_arith:.3f}, "
+          f"logic={cpt_logic:.3f}")
+    return cpt_arith, cpt_logic
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +300,8 @@ def _calibrate_cpt():
 # ---------------------------------------------------------------------------
 
 def generate_parallel(num_examples, min_tok, max_tok, base_seed,
-                      num_workers, cpt, bin_ranges=None, chunk_size=500):
+                      num_workers, cpt_arith, cpt_logic,
+                      bin_ranges=None, chunk_size=500):
     """Generate num_examples using multiprocessing with streaming progress."""
     master_rng = random.Random(base_seed)
 
@@ -302,7 +319,8 @@ def generate_parallel(num_examples, min_tok, max_tok, base_seed,
                 bin_offset += chunk_size
             else:
                 batch_bins = None
-            yield (batch_seeds, min_tok, max_tok, batch_bins, cpt)
+            yield (batch_seeds, min_tok, max_tok, batch_bins,
+                   cpt_arith, cpt_logic)
             yielded += chunk_size
 
     pool = mp.Pool(processes=num_workers)
@@ -382,7 +400,7 @@ def main():
     print("Tokenizer ready.")
 
     print("Calibrating chars/token ratio...")
-    cpt = _calibrate_cpt()
+    cpt_arith, cpt_logic = _calibrate_cpt()
 
     # --- Training set ---
     print(f"\nGenerating {args.num_train} training examples "
@@ -394,7 +412,8 @@ def main():
         max_tok=args.max_tokens,
         base_seed=args.seed,
         num_workers=args.num_workers,
-        cpt=cpt,
+        cpt_arith=cpt_arith,
+        cpt_logic=cpt_logic,
         bin_ranges=None,
         chunk_size=args.chunk_size,
     )
@@ -418,7 +437,8 @@ def main():
         max_tok=args.max_tokens,
         base_seed=args.seed + 1,
         num_workers=args.num_workers,
-        cpt=cpt,
+        cpt_arith=cpt_arith,
+        cpt_logic=cpt_logic,
         bin_ranges=eval_bin_ranges,
         chunk_size=args.chunk_size,
     )
